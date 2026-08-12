@@ -1,0 +1,24 @@
+[Unit]
+Description=9929 GOST MTCP v1 Watchdog
+After=network-online.target 9929-gost-mtcp.service
+Wants=network-online.target 9929-gost-mtcp.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/root/9929-gost-mtcp/cn
+Environment="MTCP_LIB=/root/9929-gost-mtcp/cn/mtcp-lib.sh"
+Environment="MTCP_PREWARM=/root/9929-gost-mtcp/cn/mtcp-prewarm.sh"
+ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/cn/mtcp.conf
+ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/cn/mtcp-watchdog.sh
+ExecStart=/root/9929-gost-mtcp/cn/mtcp-watchdog.sh /root/9929-gost-mtcp/cn/mtcp.conf
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=9929 GOST MTCP v1 Anchor Endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat -d -d TCP-LISTEN:12346,bind=127.0.0.1,reuseaddr,fork EXEC:/bin/cat
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

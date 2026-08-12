@@ -1,0 +1,15 @@
+services:
+- name: mtcp-server
+  addr: :11000
+  handler:
+    type: relay
+  listener:
+    type: mtcp
+    metadata:
+      mux.version: 2
+      mux.keepaliveDisabled: false
+      mux.keepaliveInterval: 10s
+      mux.keepaliveTimeout: 30s
+      mux.maxFrameSize: 32768
+      mux.maxReceiveBuffer: 33554432
+      mux.maxStreamBuffer: 4194304

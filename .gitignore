@@ -1,0 +1,13 @@
+# GOST binary and runtime state
+cn/gost
+jp/gost
+cn/state/*
+!cn/state/.gitkeep
+
+# macOS
+.DS_Store
+
+# Local backups and installer temp files
+*.bak.*
+cn/.cn.yaml.tmp.*
+cn/.mtcp.conf.tmp.*

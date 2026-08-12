@@ -1,0 +1,22 @@
+[Unit]
+Description=9929 GOST MTCP v1 JP Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/root/9929-gost-mtcp/jp
+ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/jp/gost
+ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/jp/jp.yaml
+ExecStart=/root/9929-gost-mtcp/jp/gost -D -C /root/9929-gost-mtcp/jp/jp.yaml
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

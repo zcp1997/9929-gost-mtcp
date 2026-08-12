@@ -1,0 +1,20 @@
+[Unit]
+Description=9929 GOST MTCP v1 Anchor Stream
+After=9929-gost-mtcp.service
+Requires=9929-gost-mtcp.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/
+# 默认 Relay 不改 nodelay。Anchor 主动发送 1 Byte，随后持续读取，长期占住一个 logical stream。
+ExecStart=/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/12001; printf "A" >&3; exec cat <&3 >/dev/null'
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+# 故意没有 [Install]：不要 enable。
+# 只允许 prewarm/watchdog 控制，以免开机时抢先锚定未经优选的 outer。
