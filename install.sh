@@ -43,6 +43,11 @@ show_usage() {
   bash install.sh cn          直接安装 CN 端
   bash install.sh remote      直接安装 Remote 端
   bash install.sh --help      查看帮助
+
+下载说明：
+  CN 默认通过 https://ghfast.top/ 加速下载 GitHub Release。
+  如需强制直连 GitHub：GITHUB_PROXY_PREFIX= bash install.sh cn
+  Remote 默认直连；也可设置 GITHUB_PROXY_PREFIX 使用自定义前缀。
 EOF
 }
 
@@ -114,6 +119,7 @@ show_next_steps() {
   3. CN 业务监听端口和 Anchor 监听端口
 
 注意：CN 安装完成后不会自动启动服务，脚本会打印准确的 systemctl 启动命令。
+GOST 默认通过 https://ghfast.top/https://github.com/... 下载，并继续校验官方 checksums.txt。
 EOF
             ;;
         remote)
@@ -142,6 +148,8 @@ install_cn() {
     SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
     GOST_REPO="go-gost/gost"
     GOST_VERSION="${GOST_VERSION:-v3.2.6}"
+    # 使用 ${VAR-default} 而非 ${VAR:-default}，允许 GITHUB_PROXY_PREFIX= 显式关闭代理。
+    GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX-https://ghfast.top/}"
     GOST_TMP_DIR=""
     CONFIG_TMP_FILES=()
 
@@ -646,13 +654,20 @@ install_cn() {
         command -v curl >/dev/null 2>&1 || { echo "missing curl" >&2; exit 1; }
         command -v tar >/dev/null 2>&1 || { echo "missing tar" >&2; exit 1; }
 
-        local tag="$GOST_VERSION" version arch asset base_url expected actual gost_target_tmp
+        local tag="$GOST_VERSION" version arch asset upstream_base_url base_url expected actual gost_target_tmp source_name
         [[ -n "$tag" ]] || { echo "unable to resolve GOST release tag" >&2; exit 1; }
         [[ "$tag" == v* ]] || tag="v$tag"
         version="${tag#v}"
         arch="$(linux_arch)"
         asset="gost_${version}_linux_${arch}.tar.gz"
-        base_url="https://github.com/$GOST_REPO/releases/download/$tag"
+        upstream_base_url="https://github.com/$GOST_REPO/releases/download/$tag"
+        if [[ -n "$GITHUB_PROXY_PREFIX" ]]; then
+            base_url="${GITHUB_PROXY_PREFIX%/}/$upstream_base_url"
+            source_name="GitHub via ${GITHUB_PROXY_PREFIX%/}"
+        else
+            base_url="$upstream_base_url"
+            source_name="GitHub direct"
+        fi
         GOST_TMP_DIR="$(mktemp -d)"
 
         curl -fsSL --retry 3 "$base_url/$asset" -o "$GOST_TMP_DIR/$asset"
@@ -676,7 +691,7 @@ install_cn() {
         CONFIG_TMP_FILES+=("$gost_target_tmp")
         install -m 755 "$GOST_TMP_DIR/gost" "$gost_target_tmp"
         mv -f "$gost_target_tmp" "$CN_DIR/gost"
-        echo "Downloaded GOST $tag ($arch) from GitHub."
+        echo "Downloaded GOST $tag ($arch) from $source_name."
     }
 
     check_dependencies
@@ -714,6 +729,7 @@ install_remote() {
     ANCHOR_UNIT="9929-gost-mtcp-remote-anchor-endpoint.service"
     GOST_REPO="go-gost/gost"
     GOST_VERSION="${GOST_VERSION:-v3.2.6}"
+    GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX-}"
     GOST_TMP_DIR=""
     LISTEN_PORT=""
     SOCAT_BIN=""
@@ -883,14 +899,21 @@ install_remote() {
     }
 
     download_gost() {
-        local tag="$GOST_VERSION" version arch asset base_url expected actual target_tmp
+        local tag="$GOST_VERSION" version arch asset upstream_base_url base_url expected actual target_tmp source_name
 
         [[ -n "$tag" ]] || { echo "unable to resolve GOST release tag" >&2; exit 1; }
         [[ "$tag" == v* ]] || tag="v$tag"
         version="${tag#v}"
         arch="$(linux_arch)"
         asset="gost_${version}_linux_${arch}.tar.gz"
-        base_url="https://github.com/$GOST_REPO/releases/download/$tag"
+        upstream_base_url="https://github.com/$GOST_REPO/releases/download/$tag"
+        if [[ -n "$GITHUB_PROXY_PREFIX" ]]; then
+            base_url="${GITHUB_PROXY_PREFIX%/}/$upstream_base_url"
+            source_name="GitHub via ${GITHUB_PROXY_PREFIX%/}"
+        else
+            base_url="$upstream_base_url"
+            source_name="GitHub direct"
+        fi
         GOST_TMP_DIR="$(mktemp -d)"
 
         curl -fsSL --retry 3 "$base_url/$asset" -o "$GOST_TMP_DIR/$asset"
@@ -912,7 +935,7 @@ install_remote() {
         TMP_FILES+=("$target_tmp")
         install -m 755 "$GOST_TMP_DIR/gost" "$target_tmp"
         mv -f "$target_tmp" "$REMOTE_DIR/gost"
-        echo "Downloaded GOST $tag ($arch) from GitHub."
+        echo "Downloaded GOST $tag ($arch) from $source_name."
     }
 
     verify_rendered_unit() {

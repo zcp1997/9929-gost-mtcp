@@ -47,7 +47,7 @@ Remote MTCP 端口（默认 :6600）
 
 - Linux，且使用 systemd；
 - root 权限；
-- CN 和 Remote 都能访问 GitHub Release；
+- CN 能访问 `ghfast.top`，Remote 能访问 GitHub Release；
 - 当前只支持填写 Remote 的 **IPv4 地址**，不支持域名或 IPv6；
 - Remote 防火墙或安全组能按来源 IP 放行 MTCP 端口。
 
@@ -90,7 +90,29 @@ apt-get install -y socat
 
 ### 2. 在两台服务器上下载完整项目
 
-CN 和 Remote 都执行：
+#### CN：中国大陆服务器通过 ghfast.top
+
+```bash
+sudo -i
+cd /root
+git clone https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
+cd /root/9929-gost-mtcp
+```
+
+CN 更新项目：
+
+```bash
+cd /root/9929-gost-mtcp
+git pull --ff-only
+```
+
+克隆后的 `origin` 已经是 ghfast 地址，因此后续 `git pull` 也会继续走镜像。
+
+> ghfast 的正确格式是 `https://ghfast.top/https://github.com/...`。
+>
+> `https://ghfast.top/http://github.com/...` 当前会返回 `403`，不要使用少一个 `s` 的写法。
+
+#### Remote：境外服务器直连 GitHub
 
 ```bash
 sudo -i
@@ -99,7 +121,7 @@ git clone https://github.com/zcp1997/9929-gost-mtcp.git
 cd /root/9929-gost-mtcp
 ```
 
-已经克隆过时：
+Remote 更新项目同样执行：
 
 ```bash
 cd /root/9929-gost-mtcp
@@ -251,7 +273,7 @@ CN 安装器会：
 
 1. 检查输入格式及已配置线路的端口冲突；
 2. 写入 Remote IPv4、Remote 端口、业务端口和 Anchor 端口；
-3. 下载并校验 GOST；
+3. 默认通过 `ghfast.top` 下载并校验 GOST；
 4. 为当前线路生成独立的 systemd unit；
 5. 执行 `systemctl daemon-reload`；
 6. 打印当前线路准确的启动命令。
@@ -429,6 +451,36 @@ GOST_VERSION=v3.2.6 bash install.sh cn
 
 安装器会按照版本号构造官方 Release 文件名；使用其他版本前请自行确认兼容性。
 
+### GitHub 下载镜像规则
+
+- CN 安装默认使用：
+
+  ```text
+  https://ghfast.top/https://github.com/go-gost/gost/releases/...
+  ```
+
+- Remote 安装默认直连 GitHub；
+- 下载的压缩包仍会和同一来源的 `checksums.txt` 做 SHA-256 校验；
+- CN 临时强制直连 GitHub：
+
+  ```bash
+  GITHUB_PROXY_PREFIX= bash install.sh cn
+  ```
+
+- Remote 也需要通过 ghfast 下载时：
+
+  ```bash
+  GITHUB_PROXY_PREFIX=https://ghfast.top/ bash install.sh remote
+  ```
+
+- 使用其他兼容镜像前缀时：
+
+  ```bash
+  GITHUB_PROXY_PREFIX=https://your-mirror.example/ bash install.sh cn
+  ```
+
+镜像前缀必须采用“前缀 + 完整上游 HTTPS URL”的形式。
+
 ## 九、添加多个 Remote
 
 同一台 CN 可以连接多个 Remote。每增加一条线路，再执行一次：
@@ -481,6 +533,13 @@ bash install.sh cn
 ```bash
 cd /root/9929-gost-mtcp
 git status
+git pull --ff-only
+```
+
+如果 CN 最初是从 GitHub 直连地址克隆的，可以将远端改为 ghfast：
+
+```bash
+git remote set-url origin https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
 git pull --ff-only
 ```
 
