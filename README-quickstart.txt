@@ -31,10 +31,15 @@ CN 和 Remote 目录下没有、也不需要单独的安装脚本。
   bash install.sh cn
 
 Remote 默认监听 6600/tcp。
+CN 安装时会询问 RTT 快路准入阈值，默认 40ms，可自定义。
+CN 安装完成后会自动 enable 并启动对应的主服务与 Watchdog。
 CN 安装 GOST 时默认通过 ghfast.top 下载，Remote 默认直连 GitHub。
 如需让 CN 强制直连：GITHUB_PROXY_PREFIX= bash install.sh cn
-kr、us 是 Remote 节点/线路别名，不是 CN 地区。
+de、us 是 Remote 节点/线路别名，不是 CN 地区。
 多条 Remote 线路必须使用不同的 CN 业务端口和 Anchor 端口。
+
+别名 de 的事件日志：
+  tail -n 30 /root/9929-gost-mtcp/cn/instances/de/state/events.jsonl
 
 不要 enable CN 的 Anchor unit，它必须由 Prewarm/Watchdog 控制。
 详细说明见 README.md。

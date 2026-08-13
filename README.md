@@ -18,9 +18,9 @@
 ```text
 1. 安装 Remote
 2. 记录 Remote 的公网 IPv4 和 MTCP 端口
-3. 安装 CN
-4. 在 CN 配置最终业务后端
-5. 启动 CN 主服务和 Watchdog
+3. 安装 CN，并交互设置端口与 RTT 阈值
+4. 安装器自动启动 CN 主服务和 Watchdog
+5. 检查状态；如需修改模板后端，再重启当前线路主服务
 ```
 
 数据链路：
@@ -213,20 +213,21 @@ bash install.sh cn
 
 | 输入项 | 示例 | 说明 |
 | --- | --- | --- |
-| Remote 线路别名 | `kr` | 推荐填写；用于区分多条线路 |
+| Remote 线路别名 | `de` | 推荐填写；用于区分多条线路 |
 | Remote IPv4 | `203.0.113.10` | 填写真实 Remote 公网 IPv4 |
 | Remote MTCP 端口 | `6600` | 必须和 Remote 安装时一致 |
 | CN 业务监听端口 | `12000` | 业务客户端连接 CN 的端口 |
 | CN Anchor 监听端口 | `12001` | 只监听 `127.0.0.1`，每条线路必须不同 |
+| RTT 快路准入阈值 | `40` | 单位 ms；`minrtt` 小于该值时视为快路 |
 
-`203.0.113.10` 是文档示例地址，部署时不能照抄。
+`203.0.113.10` 是文档示例地址，部署时不能照抄。RTT 阈值第一次安装默认是 `40ms`，直接回车即可，也可以输入 `35`、`40.5` 等大于 0 的数值；重装已有线路时默认显示该线路当前值。
 
 ### 线路别名怎么填
 
-即使只有一条线路，也推荐填写简单别名，例如 `kr`、`us` 或 `remote1`：
+即使只有一条线路，也推荐填写简单别名，例如 `de`、`us` 或 `remote1`：
 
 ```text
-请输入 Remote 节点别名（如 kr、us，直接回车使用默认线路）: kr
+请输入 Remote 节点别名（如 de、us，直接回车使用默认线路）: de
 ```
 
 使用别名的优点：
@@ -237,18 +238,18 @@ bash install.sh cn
 
 别名只能使用字母、数字、下划线和连字符，最长 32 个字符，且不能使用 Anchor/Watchdog 的保留后缀。
 
-#### 填写别名，例如 `kr`
+#### 填写别名，例如 `de`
 
 会生成：
 
 ```text
-配置：cn/instances/kr/cn.yaml
-参数：cn/instances/kr/mtcp.conf
-状态：cn/instances/kr/state/
+配置：cn/instances/de/cn.yaml
+参数：cn/instances/de/mtcp.conf
+状态：cn/instances/de/state/
 
-服务：9929-gost-mtcp-kr.service
-Anchor：9929-gost-mtcp-kr-anchor.service
-Watchdog：9929-gost-mtcp-kr-watchdog.service
+服务：9929-gost-mtcp-de.service
+Anchor：9929-gost-mtcp-de-anchor.service
+Watchdog：9929-gost-mtcp-de-watchdog.service
 ```
 
 #### 别名直接回车
@@ -272,17 +273,18 @@ Watchdog：9929-gost-mtcp-watchdog.service
 CN 安装器会：
 
 1. 检查输入格式及已配置线路的端口冲突；
-2. 写入 Remote IPv4、Remote 端口、业务端口和 Anchor 端口；
+2. 写入 Remote IPv4、Remote 端口、业务端口、Anchor 端口和 RTT 阈值；
 3. 默认通过 `ghfast.top` 下载并校验 GOST；
 4. 为当前线路生成独立的 systemd unit；
 5. 执行 `systemctl daemon-reload`；
-6. 打印当前线路准确的启动命令。
+6. `enable --now` 当前线路的主服务和 Watchdog；
+7. 确认两个服务保持 `active`，并打印准确的配置、状态及事件日志路径。
 
-**CN 安装完成后不会自动启动服务。** 这是故意的，因为启动前还必须确认最终业务后端和 RTT 阈值。
+**CN 安装完成后会自动启动对应的主服务与 Watchdog，不需要再手动执行启动命令。** Anchor 不会被 enable，它仍由 Prewarm/Watchdog 按需控制。
 
-## 五、第三步：启动 CN 前配置业务后端
+## 五、安装后按需修改业务后端
 
-安装器不会询问最终后端地址，模板默认值为：
+安装器会使用当前线路 YAML 中已有的后端地址；新线路从模板继承的默认值为：
 
 ```yaml
 forwarder:
@@ -297,10 +299,10 @@ forwarder:
 - 后端在 Remote 能访问的其他机器：填写该机器的 IP 和端口；
 - 它不是 CN 本机的后端地址。
 
-如果线路别名是 `kr`：
+如果线路别名是 `de`：
 
 ```bash
-nano /root/9929-gost-mtcp/cn/instances/kr/cn.yaml
+nano /root/9929-gost-mtcp/cn/instances/de/cn.yaml
 ```
 
 如果使用默认线路：
@@ -316,40 +318,40 @@ nano /root/9929-gost-mtcp/cn/cn.yaml
   addr: 127.0.0.1:8080
 ```
 
-还应检查 Watchdog 的快路准入阈值：
+RTT 阈值已经由安装器交互写入 `mtcp.conf`，通常不需要再手动编辑。含义是新 MTCP outer 的 `minrtt` 必须小于 `ACCEPT_RTT_MS` 才进入 `FAST`。
+
+如果修改了业务后端，重启当前线路主服务让 GOST 重新加载 YAML。别名为 `de` 时：
 
 ```bash
-# 别名线路
-nano /root/9929-gost-mtcp/cn/instances/kr/mtcp.conf
-
-# 默认线路
-nano /root/9929-gost-mtcp/cn/mtcp.conf
-```
-
-核心参数：
-
-```bash
-ACCEPT_RTT_MS="40"
-```
-
-含义是新 MTCP outer 的 `minrtt` 必须小于该值才进入 `FAST`。不同线路的快慢档位不同，应按实际测试调整，不要盲目照抄 `40ms`。
-
-## 六、第四步：启动 CN
-
-安装器结束时会打印当前线路的准确命令，优先复制它打印的内容。
-
-别名为 `kr` 时：
-
-```bash
-systemctl enable --now 9929-gost-mtcp-kr.service
-systemctl enable --now 9929-gost-mtcp-kr-watchdog.service
+systemctl restart 9929-gost-mtcp-de.service
 ```
 
 使用默认线路时：
 
 ```bash
-systemctl enable --now 9929-gost-mtcp.service
-systemctl enable --now 9929-gost-mtcp-watchdog.service
+systemctl restart 9929-gost-mtcp.service
+```
+
+Watchdog 会检测 GOST PID 变化并重新执行路径优选。
+
+## 六、自动启动与服务管理
+
+安装器已经自动 enable 并启动当前线路的主服务和 Watchdog。别名为 `de` 时可以这样确认：
+
+```bash
+systemctl is-enabled 9929-gost-mtcp-de.service
+systemctl is-active 9929-gost-mtcp-de.service
+systemctl is-enabled 9929-gost-mtcp-de-watchdog.service
+systemctl is-active 9929-gost-mtcp-de-watchdog.service
+```
+
+使用默认线路时：
+
+```bash
+systemctl is-enabled 9929-gost-mtcp.service
+systemctl is-active 9929-gost-mtcp.service
+systemctl is-enabled 9929-gost-mtcp-watchdog.service
+systemctl is-active 9929-gost-mtcp-watchdog.service
 ```
 
 > **不要 enable 或手动常驻启动 Anchor unit。**
@@ -368,13 +370,22 @@ systemctl is-active 9929-gost-mtcp-remote-anchor-endpoint.service
 ss -lntp | grep -E ':6600|:12346'
 ```
 
-### 2. 检查 CN 别名线路 `kr`
+### 2. 检查 CN 别名线路 `de`
+
+别名线路的状态目录规则是：
+
+```text
+/root/9929-gost-mtcp/cn/instances/<别名>/state/
+```
+
+别名为 `de` 时，准确命令是：
 
 ```bash
-systemctl status 9929-gost-mtcp-kr.service --no-pager
-systemctl status 9929-gost-mtcp-kr-watchdog.service --no-pager
-cat /root/9929-gost-mtcp/cn/instances/kr/state/status.json
-tail -n 30 /root/9929-gost-mtcp/cn/instances/kr/state/events.jsonl
+systemctl status 9929-gost-mtcp-de.service --no-pager
+systemctl status 9929-gost-mtcp-de-watchdog.service --no-pager
+cat /root/9929-gost-mtcp/cn/instances/de/state/status.json
+tail -n 30 /root/9929-gost-mtcp/cn/instances/de/state/events.jsonl
+journalctl -u 9929-gost-mtcp-de-watchdog.service -n 100 --no-pager
 ```
 
 ### 3. 检查 CN 默认线路
@@ -493,7 +504,7 @@ bash install.sh cn
 
 | 别名 | Remote | CN 业务端口 | CN Anchor 端口 |
 | --- | --- | ---: | ---: |
-| `kr` | 韩国 Remote | `12000` | `12001` |
+| `de` | 德国 Remote | `12000` | `12001` |
 | `us` | 美国 Remote | `12002` | `12003` |
 
 安装器会检查已生成线路之间的业务端口和 Anchor 端口冲突。每条线路都有独立配置、状态、运行锁和三个 systemd unit，但共享 `cn/gost` 二进制。
@@ -514,19 +525,19 @@ bash install.sh remote
 
 如果线路仍在运行，安装器会拒绝修改配置。先停止该线路的 Watchdog、Anchor 和主服务，再使用同一个别名重装。
 
-以 `kr` 为例：
+以 `de` 为例：
 
 ```bash
 systemctl stop \
-  9929-gost-mtcp-kr-watchdog.service \
-  9929-gost-mtcp-kr-anchor.service \
-  9929-gost-mtcp-kr.service
+  9929-gost-mtcp-de-watchdog.service \
+  9929-gost-mtcp-de-anchor.service \
+  9929-gost-mtcp-de.service
 
 bash install.sh cn
-# 再次输入别名 kr
+# 再次输入别名 de
 ```
 
-安装器会复用已有线路配置，保留未参与交互的后端地址和 RTT 参数。
+安装器会复用已有线路配置，保留后端地址；Remote、端口和 RTT 阈值会按交互输入更新。重装完成后，主服务与 Watchdog 会自动重新启用并启动。
 
 ### 更新项目代码
 

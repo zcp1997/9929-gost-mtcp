@@ -31,7 +31,7 @@ show_role_guide() {
 
   q) 退出安装
 
-说明：kr、us 等名称是 Remote 节点/线路别名，不是 CN 地区。
+说明：de、us 等名称是 Remote 节点/线路别名，不是 CN 地区。
 建议先安装 Remote，再安装 CN；配置 CN 时需要 Remote 的 IPv4 地址和监听端口。
 EOF
 }
@@ -114,11 +114,12 @@ show_next_steps() {
 已选择：CN（中国大陆入口端）
 请先确认 Remote 已安装，并准备好它的公网 IPv4 和 MTCP 监听端口。
 接下来将依次询问：
-  1. Remote 节点/线路别名，例如 kr、us
+  1. Remote 节点/线路别名，例如 de、us
   2. Remote IPv4 地址和 MTCP 端口
   3. CN 业务监听端口和 Anchor 监听端口
+  4. RTT 快路准入阈值，默认 40ms，可自定义
 
-注意：CN 安装完成后不会自动启动服务，脚本会打印准确的 systemctl 启动命令。
+CN 安装完成后会自动启用并启动主服务与 Watchdog；Anchor 仍只由 Watchdog 控制。
 GOST 默认通过 https://ghfast.top/https://github.com/... 下载，并继续校验官方 checksums.txt。
 EOF
             ;;
@@ -166,6 +167,7 @@ install_cn() {
     REMOTE_PORT=""
     BUSINESS_PORT=""
     ANCHOR_PORT=""
+    ACCEPT_RTT_MS=""
 
     cleanup_gost_tmp() {
         if [[ -n "$GOST_TMP_DIR" ]]; then
@@ -225,6 +227,12 @@ install_cn() {
         (( 10#$port >= 1 && 10#$port <= 65535 ))
     }
 
+    valid_rtt_threshold() {
+        local value="$1"
+        [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ && ${#value} -le 10 ]] || return 1
+        awk -v value="$value" 'BEGIN { exit !(value > 0) }'
+    }
+
     valid_alias() {
         local alias="$1"
         [[ "$alias" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || return 1
@@ -238,7 +246,7 @@ install_cn() {
         local input
 
         while :; do
-            if ! read -r -p "请输入 Remote 节点别名（如 kr、us，直接回车使用默认线路）: " input; then
+            if ! read -r -p "请输入 Remote 节点别名（如 de、us，直接回车使用默认线路）: " input; then
                 echo "未输入 Remote 节点别名，安装已取消。" >&2
                 exit 1
             fi
@@ -333,6 +341,23 @@ install_cn() {
         done
     }
 
+    prompt_rtt_threshold() {
+        local default_value="$1" value
+
+        while :; do
+            if ! read -r -p "请输入 RTT 快路准入阈值（毫秒，minrtt 小于该值视为快路） [$default_value]: " value; then
+                echo "未输入 RTT 阈值，安装已取消。" >&2
+                exit 1
+            fi
+            value="${value:-$default_value}"
+            if valid_rtt_threshold "$value"; then
+                ACCEPT_RTT_MS="$value"
+                return
+            fi
+            echo "RTT 阈值必须是大于 0 的数字，例如 40 或 40.5，请重新输入。" >&2
+        done
+    }
+
     PORT_CONFLICT_CONFIG=""
     PORT_CONFLICT_KEY=""
 
@@ -388,16 +413,18 @@ install_cn() {
     }
 
     configure_instance() {
-        local remote_default remote_port_default business_port_default anchor_port_default
+        local remote_default remote_port_default business_port_default anchor_port_default accept_rtt_default
         local input yaml_tmp conf_tmp
 
         remote_default="$(read_conf_value DST "")"
         remote_port_default="$(read_conf_value PORT "6600")"
         business_port_default="$(read_conf_value BUSINESS_PORT "12000")"
         anchor_port_default="$(read_conf_value ANCHOR_PORT "12001")"
+        accept_rtt_default="$(read_conf_value ACCEPT_RTT_MS "40")"
         valid_port "$remote_port_default" || remote_port_default="6600"
         valid_port "$business_port_default" || business_port_default="12000"
         valid_port "$anchor_port_default" || anchor_port_default="12001"
+        valid_rtt_threshold "$accept_rtt_default" || accept_rtt_default="40"
 
         while :; do
             if valid_ipv4 "$remote_default"; then
@@ -428,6 +455,7 @@ install_cn() {
             fi
             echo "Anchor 端口不能与业务监听端口相同，请重新输入。" >&2
         done
+        prompt_rtt_threshold "$accept_rtt_default"
 
         yaml_tmp="$(mktemp "$INSTANCE_DIR/.cn.yaml.tmp.XXXXXX")"
         conf_tmp="$(mktemp "$INSTANCE_DIR/.mtcp.conf.tmp.XXXXXX")"
@@ -490,6 +518,7 @@ install_cn() {
             -v remote_port="$REMOTE_PORT" \
             -v business_port="$BUSINESS_PORT" \
             -v anchor_port="$ANCHOR_PORT" \
+            -v accept_rtt_ms="$ACCEPT_RTT_MS" \
             -v state_dir="$STATE_DIR_PATH" '
             BEGIN {
                 values["UNIT"] = main_unit
@@ -499,6 +528,7 @@ install_cn() {
                 values["BUSINESS_PORT"] = business_port
                 values["ANCHOR_HOST"] = "127.0.0.1"
                 values["ANCHOR_PORT"] = anchor_port
+                values["ACCEPT_RTT_MS"] = accept_rtt_ms
                 values["STATE_DIR"] = state_dir
                 values["STATE_FILE"] = state_dir "/runtime.state"
                 values["STATUS_JSON"] = state_dir "/status.json"
@@ -530,7 +560,7 @@ install_cn() {
 
         mv -f "$yaml_tmp" "$YAML_CONFIG"
         mv -f "$conf_tmp" "$MTCP_CONFIG"
-        echo "已配置 CN → Remote 线路 ${ROUTE_LABEL}: Remote=${REMOTE_IP}:${REMOTE_PORT}, 业务端口=${BUSINESS_PORT}, Anchor 端口=${ANCHOR_PORT}。"
+        echo "已配置 CN → Remote 线路 ${ROUTE_LABEL}: Remote=${REMOTE_IP}:${REMOTE_PORT}, 业务端口=${BUSINESS_PORT}, Anchor 端口=${ANCHOR_PORT}, RTT 准入阈值=${ACCEPT_RTT_MS}ms。"
     }
 
     verify_rendered_systemd_unit() {
@@ -621,6 +651,29 @@ install_cn() {
         render_systemd_unit watchdog "$WATCHDOG_UNIT"
     }
 
+    enable_and_start_cn_units() {
+        echo "正在启用并启动 $MAIN_UNIT ……"
+        if ! systemctl enable --now "$MAIN_UNIT"; then
+            echo "主服务启动失败，请检查: systemctl status $MAIN_UNIT --no-pager" >&2
+            exit 1
+        fi
+
+        echo "正在启用并启动 $WATCHDOG_UNIT ……"
+        if ! systemctl enable --now "$WATCHDOG_UNIT"; then
+            echo "Watchdog 启动失败；主服务可能仍在运行，请检查: systemctl status $WATCHDOG_UNIT --no-pager" >&2
+            exit 1
+        fi
+
+        if ! systemctl is-active --quiet "$MAIN_UNIT"; then
+            echo "主服务未保持 active，请检查: systemctl status $MAIN_UNIT --no-pager" >&2
+            exit 1
+        fi
+        if ! systemctl is-active --quiet "$WATCHDOG_UNIT"; then
+            echo "Watchdog 未保持 active，请检查: systemctl status $WATCHDOG_UNIT --no-pager" >&2
+            exit 1
+        fi
+    }
+
     sha256_file() {
         if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$1" | awk '{print $1}'
@@ -708,12 +761,14 @@ install_cn() {
 
     install_systemd_units
     systemctl daemon-reload
+    enable_and_start_cn_units
 
-    echo "9929-gost-mtcp CN → Remote 线路 ${ROUTE_LABEL} 已安装到 $BASE"
+    echo "9929-gost-mtcp CN → Remote 线路 ${ROUTE_LABEL} 已安装并启动。"
     echo "配置文件: $YAML_CONFIG, $MTCP_CONFIG"
-    echo "未启动任何服务。启动命令："
-    echo "  systemctl enable --now $MAIN_UNIT"
-    echo "  systemctl enable --now $WATCHDOG_UNIT"
+    echo "运行服务: $MAIN_UNIT, $WATCHDOG_UNIT"
+    echo "状态文件: $STATE_DIR_PATH/status.json"
+    echo "事件日志: $STATE_DIR_PATH/events.jsonl"
+    echo "查看事件: tail -n 30 $STATE_DIR_PATH/events.jsonl"
     echo "Anchor unit $ANCHOR_UNIT 没有 [Install]，不要 enable。"
 }
 
