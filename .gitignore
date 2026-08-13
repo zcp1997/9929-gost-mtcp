@@ -1,8 +1,9 @@
 # GOST binary and runtime state
 cn/gost
-jp/gost
+remote/gost
 cn/state/*
 !cn/state/.gitkeep
+cn/instances/
 
 # macOS
 .DS_Store
@@ -11,3 +12,6 @@ cn/state/*
 *.bak.*
 cn/.cn.yaml.tmp.*
 cn/.mtcp.conf.tmp.*
+cn/.gost.tmp.*
+remote/.gost.tmp.*
+remote/.remote.yaml.tmp.*

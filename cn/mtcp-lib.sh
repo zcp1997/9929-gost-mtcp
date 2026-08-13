@@ -2,21 +2,38 @@
 set -uo pipefail
 
 CONFIG_DEFAULT="/root/9929-gost-mtcp/cn/mtcp.conf"
+CONFIG_KEYS=(
+    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT
+    ACCEPT_RTT_MS
+    LIVE_RTT_WARN_MS LIVE_RTT_CRIT_MS LIVE_RTT_WARN_HOLD_SEC
+    LIVE_RTT_CRIT_HOLD_SEC LIVE_RTT_RECOVER_MS LIVE_RTT_RECOVER_HOLD_SEC
+    PREWARM_MAX_DRAWS RECOVERY_PREWARM_DRAWS DEGRADED_RETRY_DRAWS
+    PREWARM_NO_SESSION_ATTEMPTS PREWARM_CONNECT_WAIT_SEC PREWARM_STABLE_REQUIRED
+    PREWARM_STABLE_INTERVAL_SEC PREWARM_KILL_WAIT_SEC PREWARM_TOTAL_TIMEOUT_SEC
+    ANCHOR_START_TIMEOUT_SEC ANCHOR_STABLE_REQUIRED ANCHOR_STABLE_INTERVAL_SEC
+    ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC
+    WATCH_INTERVAL_SEC ZERO_GRACE_SEC REMOTE_PROBE_INTERVAL_SEC
+    REMOTE_PROBE_TIMEOUT_SEC REMOTE_PROBE_ATTEMPTS DOWN_RETRY_SEC
+    STUCK_RESTART_AFTER_SEC RESTART_COOLDOWN_SEC MULTI_CONFIRM_COUNT
+    STATE_DIR STATE_FILE STATUS_JSON EVENT_FILE RETENTION_SEC
+)
 
 load_config() {
     local cfg="${1:-$CONFIG_DEFAULT}"
     [[ -r "$cfg" ]] || { echo "config not readable: $cfg" >&2; return 1; }
-    # shellcheck disable=SC1090
-    source "$cfg"
 
-    : "${UNIT:?UNIT missing}"
-    : "${ANCHOR_UNIT:?ANCHOR_UNIT missing}"
-    : "${DST:?DST missing}"
-    : "${PORT:?PORT missing}"
-    : "${BUSINESS_PORT:?BUSINESS_PORT missing}"
-    : "${ANCHOR_HOST:?ANCHOR_HOST missing}"
-    : "${ANCHOR_PORT:?ANCHOR_PORT missing}"
-    : "${ACCEPT_RTT_MS:?ACCEPT_RTT_MS missing}"
+    # watchdog 会重复加载配置；先清空已知键，避免删除配置项后继续沿用旧值。
+    unset "${CONFIG_KEYS[@]}"
+    # shellcheck disable=SC1090
+    source "$cfg" || { echo "config invalid: $cfg" >&2; return 1; }
+
+    local required
+    for required in UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT ACCEPT_RTT_MS; do
+        if [[ -z "${!required:-}" ]]; then
+            echo "$required missing in config: $cfg" >&2
+            return 1
+        fi
+    done
 
     STATE_DIR="${STATE_DIR:-/root/9929-gost-mtcp/cn/state}"
     STATE_FILE="${STATE_FILE:-${STATE_DIR}/runtime.state}"
@@ -62,6 +79,8 @@ get_unit_main_pid() {
     pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     case "$pid" in ''|*[!0-9]*) echo 0 ;; *) echo "$pid" ;; esac
 }
+# UNIT 由 load_config 从实例配置加载。
+# shellcheck disable=SC2153
 get_main_pid() { get_unit_main_pid "$UNIT"; }
 get_anchor_pid() { get_unit_main_pid "$ANCHOR_UNIT"; }
 service_is_active() { systemctl is-active --quiet "$UNIT"; }

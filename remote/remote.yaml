@@ -1,6 +1,6 @@
 services:
 - name: mtcp-server
-  addr: :11000
+  addr: :6600
   handler:
     type: relay
   listener:

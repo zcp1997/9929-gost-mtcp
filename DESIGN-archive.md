@@ -1,13 +1,5 @@
 # 9929-gost-mtcp：原始方案讨论归档
 
-> 这是从分享对话整理出的历史设计记录，不是当前部署说明。当前 v1 的目录、服务名、配置路径和操作命令以 `README.md` 为准。
-
-前一版文章：
-
-https://www.v2ex.com/t/1233477
-
-测试环境仍然是：**中国大陆某 9929 线路 + 日本某 VPS**。
-
 v1 主要解决的是一个问题：
 
 > GOST MTCP 启动时如果碰到 ECMP，让脚本不断重建 outer TCP，直到抽到低延迟路径，然后后续业务长期复用这一条连接。
@@ -17,7 +9,7 @@ v1 实际跑下来效果很好，但它本质上还是“**启动预热**”。�
 - 没业务时，MTCP outer 可能因为没有 logical stream 而消失；
 - outer 被 RST / `ss -K` / TCP 超时弄掉后，希望自动重新优选；
 - GOST 自己 crash / restart 后，希望自动重新优选；
-- 日本机器或 `:11000` 黑洞一段时间后，希望不要疯狂 restart，恢复后再重新优选；
+- 日本机器或 `:6600` 黑洞一段时间后，希望不要疯狂 restart，恢复后再重新优选；
 - 当前 RTT 因拥塞、DDoS、排队临时飙高时，不希望 watchdog 误杀一条本来就在快路上的连接；
 - 运行态应该始终尽量保持 **唯一一条 MTCP outer TCP**。
 
@@ -51,7 +43,7 @@ GOST kill -9 后：
 51.305ms → reject
 33.147ms → accept
 
-JP :11000 临时 DROP，恢复后：
+Remote :6600 临时 DROP，恢复后：
 33.525ms → accept
 ```
 
@@ -96,7 +88,7 @@ GOST MTCP 则可以变成：
 
 ```text
 业务 TCP 1 ┐
-业务 TCP 2 ├── logical streams ──→ 单条 MTCP outer TCP → JP
+业务 TCP 2 ├── logical streams ──→ 单条 MTCP outer TCP → Remote
 业务 TCP 3 ┘
 ```
 
@@ -137,7 +129,7 @@ CN GOST :12000
       ↓
 唯一 MTCP outer TCP
       ↓
-JP GOST :11000
+Remote GOST :6600
       ↓
 目标 TCP 服务
 ```
@@ -149,7 +141,7 @@ CN 127.0.0.1:12001
       ↓
 同一个 MTCP session
       ↓
-JP 127.0.0.1:12346
+Remote 127.0.0.1:12346
 ```
 
 最终就是：
@@ -202,7 +194,7 @@ CN 增加一个只监听本机的入口：
       addr: 127.0.0.1:12346
 ```
 
-JP 提供一个简单的 TCP endpoint：
+Remote 提供一个简单的 TCP endpoint：
 
 ```bash
 socat -d -d \
@@ -261,7 +253,7 @@ Stream Buffer    4 MiB
 示例公网地址继续用文档地址：
 
 ```text
-JP：example.invalid:11000
+Remote：example.invalid:6600
 业务入口：:12000
 Anchor：127.0.0.1:12001
 后端 TCP：127.0.0.1:2345
@@ -298,10 +290,10 @@ services:
 chains:
 - name: chain-mtcp
   hops:
-  - name: jp
+  - name: remote
     nodes:
-    - name: jp-mtcp
-      addr: example.invalid:11000
+    - name: remote-mtcp
+      addr: example.invalid:6600
       connector:
         type: relay
       dialer:
@@ -321,7 +313,7 @@ chains:
 实际验证时：
 
 ```bash
-ss -ntH "dst example.invalid:11000" | grep -c '^ESTAB'
+ss -ntH "dst example.invalid:6600" | grep -c '^ESTAB'
 ```
 
 正常始终应该是：
@@ -403,7 +395,7 @@ Anchor 建下一候选
 新连接准入时，我继续用：
 
 ```bash
-ss -tin "dst example.invalid:11000"
+ss -tin "dst example.invalid:6600"
 ```
 
 重点看：
@@ -507,7 +499,7 @@ outer = 0
 Watchdog 会进一步判断：
 
 ```text
-JP :11000 能连？
+Remote :6600 能连？
 ```
 
 如果远端也挂了：
@@ -536,7 +528,7 @@ Watchdog 会确认多次后再处理，不会随便猜哪一条该杀。
 
 这是 v2 相比 v1 最重要的一块。
 
-假设 JP `:11000` 被 DROP：
+假设 Remote `:6600` 被 DROP：
 
 ```text
 原 outer
@@ -560,7 +552,7 @@ DOWN / REMOTE
 不刷一堆无意义日志
 ```
 
-等 JP 恢复：
+等 Remote 恢复：
 
 ```text
 REMOTE_TCP_UP
@@ -590,7 +582,7 @@ FAST
 
 ### 10.1 Anchor endpoint 临时中断
 
-JP `12346` 手工停掉再恢复。
+Remote `12346` 手工停掉再恢复。
 
 结果：
 
@@ -611,7 +603,7 @@ Anchor service 重连
 ### 10.2 手工 kill 当前 outer
 
 ```bash
-ss -K dst example.invalid dport = :11000
+ss -K dst example.invalid dport = :6600
 ```
 
 一次测试日志大概是：
@@ -641,7 +633,7 @@ outer_count = 1
 ### 10.3 `kill -9` GOST
 
 ```bash
-PID=$(systemctl show gost-mtcp-jpv22.service -p MainPID --value)
+PID=$(systemctl show gost-mtcp-remotev22.service -p MainPID --value)
 kill -9 "$PID"
 ```
 
@@ -663,14 +655,14 @@ ANCHOR_BOUND
 
 ---
 
-### 10.4 JP `:11000` 做黑洞测试
+### 10.4 Remote `:6600` 做黑洞测试
 
-JP 用 nftables：
+Remote 用 nftables：
 
 ```bash
 nft add table inet filter
 nft add chain inet filter input '{ type filter hook input priority 0; }'
-nft insert rule inet filter input tcp dport 11000 drop
+nft insert rule inet filter input tcp dport 6600 drop
 ```
 
 这和直接 RST 不一样，`drop` 会更接近真实线路黑洞：现有 TCP 不会立即知道自己死了，而是经历重传 / timeout。
@@ -709,21 +701,21 @@ FAST
 CN 最终有 3 个 unit：
 
 ```text
-gost-mtcp-jpv22.service
-gost-mtcp-jpv22-anchor.service
-gost-mtcp-jpv22-watchdog.service
+gost-mtcp-remotev22.service
+gost-mtcp-remotev22-anchor.service
+gost-mtcp-remotev22-watchdog.service
 ```
 
 其中：
 
 ```text
-gost-mtcp-jpv22.service
+gost-mtcp-remotev22.service
 → enable
 
-gost-mtcp-jpv22-watchdog.service
+gost-mtcp-remotev22-watchdog.service
 → enable
 
-gost-mtcp-jpv22-anchor.service
+gost-mtcp-remotev22-anchor.service
 → 不要 enable
 ```
 
@@ -743,7 +735,7 @@ Anchor 故意只允许 Prewarm / Watchdog 控制。
 
 这就和设计目标相反了。
 
-JP 的 Anchor endpoint 建议也做成 systemd，不要靠一个 SSH 窗口里 `nohup socat`：
+Remote 的 Anchor endpoint 建议也做成 systemd，不要靠一个 SSH 窗口里 `nohup socat`：
 
 ```ini
 [Unit]
@@ -768,7 +760,7 @@ WantedBy=multi-user.target
 核心配置全部单独放到：
 
 ```text
-/root/mtcpjpv22/mtcp-jp.conf
+/root/mtcpremotev22/mtcp-remote.conf
 ```
 
 Watchdog 每轮重新 `source`，所以很多阈值改完不需要重启 watchdog。
@@ -819,7 +811,7 @@ state/runtime-v22.state
 查看状态：
 
 ```bash
-cat /root/mtcpjpv22/state/status-v22.json | python3 -m json.tool
+cat /root/mtcpremotev22/state/status-v22.json | python3 -m json.tool
 ```
 
 正常类似：
@@ -840,7 +832,7 @@ cat /root/mtcpjpv22/state/status-v22.json | python3 -m json.tool
 查看事件：
 
 ```bash
-tail -f /root/mtcpjpv22/state/events-v22.jsonl
+tail -f /root/mtcpremotev22/state/events-v22.jsonl
 ```
 
 事件只保留一天，并且最终版修了几个日志细节：
@@ -856,13 +848,13 @@ tail -f /root/mtcpjpv22/state/events-v22.jsonl
 看有效 outer：
 
 ```bash
-ss -ntp "dst example.invalid:11000"
+ss -ntp "dst example.invalid:6600"
 ```
 
 看 TCP 信息：
 
 ```bash
-ss -tin "dst example.invalid:11000"
+ss -tin "dst example.invalid:6600"
 ```
 
 如果远端黑洞后旧连接还残留在：
@@ -877,7 +869,7 @@ FIN-WAIT-1
 
 ```bash
 ss -tin state established \
-  "dst example.invalid dport = :11000"
+  "dst example.invalid dport = :6600"
 ```
 
 正常模型永远是：
@@ -925,18 +917,18 @@ Watchdog 能做到的是：
 ## 16. 最终目录
 
 ```text
-/root/mtcpjpv22/
+/root/mtcpremotev22/
 ├── cn.yaml
-├── mtcp-jp.conf
+├── mtcp-remote.conf
 ├── mtcp-lib-v22.sh
 ├── mtcp-prewarm-v22.sh
 ├── mtcp-watchdog-v22.sh
-├── gost-mtcp-jpv22.service
-├── gost-mtcp-jpv22-anchor.service
-├── gost-mtcp-jpv22-watchdog.service
+├── gost-mtcp-remotev22.service
+├── gost-mtcp-remotev22-anchor.service
+├── gost-mtcp-remotev22-watchdog.service
 ├── install-v22-cn.sh
-├── jp/
-│   └── gost-mtcp-jpv22-anchor-endpoint.service
+├── remote/
+│   └── gost-mtcp-remotev22-anchor-endpoint.service
 └── state/
     ├── runtime-v22.state
     ├── status-v22.json
@@ -992,7 +984,7 @@ minrtt 保持快路档位
 - Anchor 中断；
 - outer RST / `ss -K`；
 - GOST `kill -9`；
-- JP `:11000` TCP 黑洞；
+- Remote `:6600` TCP 黑洞；
 - 恢复后重新选路；
 - RTT 临时波动；
 

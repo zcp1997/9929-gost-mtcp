@@ -1,29 +1,64 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG="${1:-/root/9929-gost-mtcp/cn/mtcp.conf}"
+DEFAULT_CONFIG="${MTCP_CONFIG:-/root/9929-gost-mtcp/cn/mtcp.conf}"
+CONFIG="${1:-$DEFAULT_CONFIG}"
+ADOPT_MODE=0
+if [[ "${1:-}" == "--adopt" ]]; then
+    CONFIG="$DEFAULT_CONFIG"
+    ADOPT_MODE=1
+elif [[ "${2:-}" == "--adopt" ]]; then
+    ADOPT_MODE=1
+fi
+
 LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
 PREWARM="${MTCP_PREWARM:-/root/9929-gost-mtcp/cn/mtcp-prewarm.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 1
 
-LOCK="/run/9929-gost-mtcp-watchdog.lock"
+LOCK_ID="${UNIT%.service}"
+LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
+LOCK="/run/${LOCK_ID}-watchdog.lock"
 exec {LOCKFD}>"$LOCK"
-flock -n "$LOCKFD" || exit 0
+if ! flock -n "$LOCKFD"; then
+    if (( ADOPT_MODE == 1 )); then
+        echo "cannot adopt: watchdog lock is held for $UNIT" >&2
+        exit 75
+    fi
+    exit 0
+fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
-STATE="INIT"; REASON=""; LAST_PID=0; LAST_NONZERO_PID=0; LAST_SPORT=""
-ZERO_SINCE=0; WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0
-LAST_REMOTE_PROBE=0; REMOTE_OK="unknown"; LAST_RESTART=0; MULTI_SEEN=0
-LAST_DEGRADED_RETRY=0; LAST_RECOVERY_ATTEMPT=0; LAST_ANCHOR_RETRY=0; LAST_PRUNE=0
-HAVE_RUNTIME=0
+
+reset_runtime_state() {
+    SAVED_BOOT_ID=""
+    STATE="INIT"; REASON=""; LAST_PID=0; LAST_NONZERO_PID=0; LAST_SPORT=""
+    ZERO_SINCE=0; WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0
+    LAST_REMOTE_PROBE=0; REMOTE_OK="unknown"; LAST_RESTART=0; MULTI_SEEN=0
+    LAST_DEGRADED_RETRY=0; LAST_RECOVERY_ATTEMPT=0; LAST_ANCHOR_RETRY=0; LAST_PRUNE=0
+    HAVE_RUNTIME=0
+}
+
+reset_runtime_state
 
 load_runtime_state() {
+    local saved_boot_id
     [[ -r "$STATE_FILE" ]] || return 1
+
+    # 先检查首行 boot ID，避免跨重启状态在校验前污染当前进程变量。
+    saved_boot_id="$(awk -F"'" 'NR == 1 && $1 == "SAVED_BOOT_ID=" { print $2; exit }' "$STATE_FILE" 2>/dev/null || true)"
+    [[ -n "$saved_boot_id" && "$saved_boot_id" == "$BOOT_ID" ]] || return 1
+
     # shellcheck disable=SC1090
-    source "$STATE_FILE" || return 1
-    [[ "${SAVED_BOOT_ID:-}" == "$BOOT_ID" ]] || return 1
+    if ! source "$STATE_FILE"; then
+        reset_runtime_state
+        return 1
+    fi
+    if [[ "${SAVED_BOOT_ID:-}" != "$BOOT_ID" ]]; then
+        reset_runtime_state
+        return 1
+    fi
     HAVE_RUNTIME=1
     return 0
 }
@@ -146,9 +181,7 @@ adopt_current() {
     save_runtime_state
 }
 
-if [[ "${2:-}" == "--adopt" || "${1:-}" == "--adopt" ]]; then
-    [[ "${1:-}" == "--adopt" ]] && CONFIG="/root/9929-gost-mtcp/cn/mtcp.conf"
-    load_config "$CONFIG" || exit 1
+if (( ADOPT_MODE == 1 )); then
     adopt_current
     exit $?
 fi
@@ -307,8 +340,13 @@ while true; do
 
     LAST_SPORT="$sport"; LAST_PID="$pid"; LAST_NONZERO_PID="$pid"
 
-    base_state="FAST"; base_reason="PATH"
-    if [[ -n "$minrtt" ]] && ! is_lt "$minrtt" "$ACCEPT_RTT_MS"; then base_state="DEGRADED"; base_reason="PATH"; fi
+    if [[ -z "$minrtt" ]]; then
+        base_state="DEGRADED"; base_reason="TCP_INFO"
+    elif is_lt "$minrtt" "$ACCEPT_RTT_MS"; then
+        base_state="FAST"; base_reason="PATH"
+    else
+        base_state="DEGRADED"; base_reason="PATH"
+    fi
 
     if [[ "$base_state" == "DEGRADED" ]]; then
         if (( LAST_DEGRADED_RETRY == 0 )); then LAST_DEGRADED_RETRY="$now"; fi

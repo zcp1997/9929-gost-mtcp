@@ -1,5 +1,5 @@
 [Unit]
-Description=9929 GOST MTCP v1 Anchor Endpoint
+Description=9929 GOST MTCP v1 Remote Anchor Endpoint
 After=network-online.target
 Wants=network-online.target
 

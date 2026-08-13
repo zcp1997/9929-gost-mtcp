@@ -28,10 +28,10 @@ services:
 chains:
 - name: chain-mtcp
   hops:
-  - name: jp
+  - name: remote
     nodes:
-    - name: jp-mtcp
-      addr: example.invalid:11000
+    - name: remote-mtcp
+      addr: remote.example.invalid:6600
       connector:
         type: relay
       dialer:
