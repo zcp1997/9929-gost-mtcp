@@ -2,621 +2,273 @@
 
 基于 GOST MTCP 的 ECMP 低延迟路径优选与故障自愈方案。
 
-> **唯一安装入口是项目根目录的 `install.sh`。**
->
-> 同一份完整项目分别放到 CN 和 Remote 服务器，先执行 `bash install.sh remote`，再执行 `bash install.sh cn`。不要进入 `cn/` 或 `remote/` 寻找安装脚本。
+## 架构
 
-## 一、先看懂两台服务器的角色
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          数据链路                                │
+└─────────────────────────────────────────────────────────────────┘
 
-| 角色 | 部署位置 | 作用 | 安装命令 |
-| --- | --- | --- | --- |
-| **Remote** | 韩国、美国等境外服务器 | 监听 MTCP，接收 CN 连接并访问最终后端 | `bash install.sh remote` |
-| **CN** | 中国大陆服务器 | 接收业务连接、连接 Remote、优选低延迟路径 | `bash install.sh cn` |
+  业务客户端                CN 服务器              Remote 服务器
+      │                  ┌──────────┐              ┌──────────┐
+      │                  │  GOST    │              │  GOST    │
+      │                  │ :12000   │              │ :6600    │
+      └────────TCP───────▶│          │              │          │
+                         │  业务入口 │              │  MTCP    │
+                         │          │              │  Relay   │
+                         │  Prewarm │─────MTCP─────▶│          │
+                         │  Anchor  │  (优选路径)   │          │
+                         │ Watchdog │              │          │
+                         └──────────┘              └────┬─────┘
+                              │                         │
+                         状态监控                    TCP 转发
+                         自动选路                        │
+                                                         ▼
+                                                   最终后端服务
+                                                   (127.0.0.1:2345)
 
-正确安装顺序：
+┌─────────────────────────────────────────────────────────────────┐
+│                         工作原理                                 │
+└─────────────────────────────────────────────────────────────────┘
 
-```text
-1. 安装 Remote
-2. 记录 Remote 的公网 IPv4 和 MTCP 端口
-3. 安装 CN，并交互设置端口与 RTT 阈值
-4. 安装器自动启动 CN 主服务和 Watchdog
-5. 检查状态；如需修改模板后端，再重启当前线路主服务
+问题：跨境线路存在 ECMP，不同 TCP 连接延迟差异大
+  快路: 32-34ms
+  慢路: 50-52ms
+
+方案：所有业务复用一条经过优选的 MTCP outer TCP
+  
+  1. Prewarm  - 建立候选连接，读取 minrtt，淘汰慢路
+  2. Anchor   - 保持轻量 stream，锁定快路不释放
+  3. Watchdog - 监控故障，自动重新优选
 ```
 
-数据链路：
+## 快速安装
 
-```text
-业务客户端
-    │
-    ▼
-CN 业务端口（默认 :12000）
-    │
-    ▼
-唯一一条经过优选的 MTCP outer TCP
-    │
-    ▼
-Remote MTCP 端口（默认 :6600）
-    │
-    ▼
-最终 TCP 后端（模板默认 127.0.0.1:2345）
-```
-
-## 二、安装前准备
-
-### 1. 系统要求
-
-- Linux，且使用 systemd；
-- root 权限；
-- CN 能访问 `ghfast.top`，Remote 能访问 GitHub Release；
-- 当前只支持填写 Remote 的 **IPv4 地址**，不支持域名或 IPv6；
-- Remote 防火墙或安全组能按来源 IP 放行 MTCP 端口。
-
-安装器只检查依赖，不会自动安装系统软件包。
-
-两端通用命令：
-
-```text
-bash curl tar awk grep install mktemp systemctl
-sha256sum 或 shasum
-```
-
-CN 额外需要：
-
-```text
-ss       # Debian/Ubuntu 通常由 iproute2 提供
-flock    # 通常由 util-linux 提供
-timeout  # 通常由 coreutils 提供
-```
-
-Remote 额外需要：
-
-```text
-socat
-```
-
-Debian/Ubuntu 可以按角色准备依赖：
+**推荐：单文件安装器（无需克隆项目）**
 
 ```bash
-# 两端通用
-apt-get update
-apt-get install -y git bash curl tar coreutils grep gawk
+# 1. 先安装 Remote（境外服务器）
+curl -fsSL https://raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s remote
 
-# 只在 CN 安装
+# 2. 记录 Remote 的公网 IPv4 和 MTCP 端口（默认 6600）
+
+# 3. 再安装 CN（中国大陆服务器）
+curl -fsSL https://raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s cn
+# 按提示输入 Remote IP、端口和 RTT 阈值（默认 40ms）
+```
+
+**传统方式（开发/调试）**
+
+```bash
+# CN 服务器
+git clone https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
+cd 9929-gost-mtcp
+bash install.sh cn
+
+# Remote 服务器
+git clone https://github.com/zcp1997/9929-gost-mtcp.git
+cd 9929-gost-mtcp
+bash install.sh remote
+```
+
+## 系统要求
+
+| 组件 | 要求 |
+|------|------|
+| **OS** | Linux + systemd |
+| **权限** | root |
+| **通用依赖** | bash, curl, tar, awk, grep, systemctl, sha256sum/shasum |
+| **CN 额外** | ss (iproute2), flock (util-linux), timeout (coreutils) |
+| **Remote 额外** | socat |
+
+Debian/Ubuntu 安装依赖：
+
+```bash
+# 通用
+apt-get install -y curl tar coreutils grep gawk systemd
+
+# CN 端
 apt-get install -y iproute2 util-linux
 
-# 只在 Remote 安装
+# Remote 端  
 apt-get install -y socat
 ```
 
-### 2. 在两台服务器上下载完整项目
+## 安装后验证
 
-#### CN：中国大陆服务器通过 ghfast.top
-
-```bash
-sudo -i
-cd /root
-git clone https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
-cd /root/9929-gost-mtcp
-```
-
-CN 更新项目：
+### Remote
 
 ```bash
-cd /root/9929-gost-mtcp
-git pull --ff-only
+systemctl status gost-mtcp-remote.service
+ss -lntp | grep ':6600'
 ```
 
-克隆后的 `origin` 已经是 ghfast 地址，因此后续 `git pull` 也会继续走镜像。
-
-> ghfast 的正确格式是 `https://ghfast.top/https://github.com/...`。
->
-> `https://ghfast.top/http://github.com/...` 当前会返回 `403`，不要使用少一个 `s` 的写法。
-
-#### Remote：境外服务器直连 GitHub
+### CN（假设线路别名为 de）
 
 ```bash
-sudo -i
-cd /root
-git clone https://github.com/zcp1997/9929-gost-mtcp.git
-cd /root/9929-gost-mtcp
+systemctl status gost-mtcp-de.service
+systemctl status gost-mtcp-de-watchdog.service
+
+# 查看状态
+cat /opt/gost-mtcp/cn/state/status.json
+
+# 查看事件日志
+tail -f /opt/gost-mtcp/cn/state/events.jsonl
+
+# 查看 outer 连接（替换实际 IP 和端口）
+ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 ```
 
-Remote 更新项目同样执行：
+正常状态：
+- `state: FAST` - 路径满足阈值
+- `outer_count: 1` - 唯一 outer TCP
+- `minrtt_ms < 40` - 快路
+- `anchor_state: up` - Anchor 正常
+
+## 常见配置
+
+### 修改 CN 后端地址
+
+CN 的 `forwarder.nodes[0].addr` 指向 Remote 要连接的最终 TCP 目标。
 
 ```bash
-cd /root/9929-gost-mtcp
-git pull --ff-only
-```
+# 单文件安装器默认路径
+nano /opt/gost-mtcp/cn/cn.yaml
 
-安装器会根据项目当前的绝对路径生成 systemd unit，因此：
+# 或传统方式路径
+nano /root/9929-gost-mtcp/cn/cn.yaml
 
-- 项目不强制放在 `/root/9929-gost-mtcp`，但推荐使用该路径；
-- **安装后不要移动、重命名或删除项目目录**，否则 systemd 中的路径会失效；
-- 两台服务器都要保留完整项目，不要只复制某个角色目录。
-
-## 三、第一步：安装 Remote
-
-在境外 Remote 服务器执行：
-
-```bash
-cd /root/9929-gost-mtcp
-bash install.sh remote
-```
-
-安装器只询问一个值：
-
-```text
-请输入 Remote 端 MTCP 监听端口 [6600]:
-```
-
-- 直接回车：使用 `6600/tcp`；
-- 输入其他端口：使用自定义端口；
-- `12346` 不可使用，它固定留给本机 Anchor endpoint；
-- 记住最终端口，安装 CN 时需要填写。
-
-Remote 安装器会自动完成：
-
-1. 检查依赖；
-2. 更新 `remote/remote.yaml` 中的监听端口；
-3. 从 GOST 官方 GitHub Release 下载默认版本 `v3.2.6`；
-4. 根据官方 `checksums.txt` 校验二进制；
-5. 将 systemd unit 写入 `/etc/systemd/system/`；
-6. enable 并 restart 以下服务：
-
-```text
-9929-gost-mtcp-remote.service
-9929-gost-mtcp-remote-anchor-endpoint.service
-```
-
-安装后检查：
-
-```bash
-systemctl status 9929-gost-mtcp-remote.service --no-pager
-systemctl status 9929-gost-mtcp-remote-anchor-endpoint.service --no-pager
-ss -lntp | grep -E ':6600|:12346'
-```
-
-使用自定义 MTCP 端口时，把检查命令中的 `6600` 换成实际端口。正常情况下：
-
-- MTCP 端口监听在 `0.0.0.0`/`[::]`；
-- Anchor endpoint `12346/tcp` 只监听 `127.0.0.1`。
-
-### Remote 必须设置防火墙
-
-Remote 的 MTCP Relay 没有配置应用层认证。**不要把 MTCP 端口无条件开放给整个互联网**，应在云安全组或主机防火墙中只允许 CN 的公网源 IPv4 访问。
-
-以 UFW 和默认端口为例：
-
-```bash
-ufw allow from <CN_PUBLIC_IP> to any port 6600 proto tcp
-```
-
-不要对公网开放 `12346/tcp`；它只应在 Remote 本机回环地址使用。
-
-完成后记录：
-
-```text
-Remote 公网 IPv4：________________
-Remote MTCP 端口：________________
-```
-
-## 四、第二步：安装 CN
-
-在中国大陆 CN 服务器执行：
-
-```bash
-cd /root/9929-gost-mtcp
-bash install.sh cn
-```
-
-安装器会依次询问：
-
-| 输入项 | 示例 | 说明 |
-| --- | --- | --- |
-| Remote 线路别名 | `de` | 推荐填写；用于区分多条线路 |
-| Remote IPv4 | `203.0.113.10` | 填写真实 Remote 公网 IPv4 |
-| Remote MTCP 端口 | `6600` | 必须和 Remote 安装时一致 |
-| CN 业务监听端口 | `12000` | 业务客户端连接 CN 的端口 |
-| CN Anchor 监听端口 | `12001` | 只监听 `127.0.0.1`，每条线路必须不同 |
-| RTT 快路准入阈值 | `40` | 单位 ms；`minrtt` 小于该值时视为快路 |
-
-`203.0.113.10` 是文档示例地址，部署时不能照抄。RTT 阈值第一次安装默认是 `40ms`，直接回车即可，也可以输入 `35`、`40.5` 等大于 0 的数值；重装已有线路时默认显示该线路当前值。
-
-### 线路别名怎么填
-
-即使只有一条线路，也推荐填写简单别名，例如 `de`、`us` 或 `remote1`：
-
-```text
-请输入 Remote 节点别名（如 de、us，直接回车使用默认线路）: de
-```
-
-使用别名的优点：
-
-- 配置、状态和 systemd unit 都按线路隔离；
-- 后续可以继续添加其他 Remote；
-- 真实 Remote IP 会写入已被 `.gitignore` 排除的 `cn/instances/`，降低误提交生产地址的风险。
-
-别名只能使用字母、数字、下划线和连字符，最长 32 个字符，且不能使用 Anchor/Watchdog 的保留后缀。
-
-#### 填写别名，例如 `de`
-
-会生成：
-
-```text
-配置：cn/instances/de/cn.yaml
-参数：cn/instances/de/mtcp.conf
-状态：cn/instances/de/state/
-
-服务：9929-gost-mtcp-de.service
-Anchor：9929-gost-mtcp-de-anchor.service
-Watchdog：9929-gost-mtcp-de-watchdog.service
-```
-
-#### 别名直接回车
-
-会使用默认线路：
-
-```text
-配置：cn/cn.yaml
-参数：cn/mtcp.conf
-状态：cn/state/
-
-服务：9929-gost-mtcp.service
-Anchor：9929-gost-mtcp-anchor.service
-Watchdog：9929-gost-mtcp-watchdog.service
-```
-
-默认线路会直接改写 Git 已跟踪的 `cn/cn.yaml` 和 `cn/mtcp.conf`。不要把其中的真实服务器地址误提交到公开仓库。
-
-### CN 安装器具体做什么
-
-CN 安装器会：
-
-1. 检查输入格式及已配置线路的端口冲突；
-2. 写入 Remote IPv4、Remote 端口、业务端口、Anchor 端口和 RTT 阈值；
-3. 默认通过 `ghfast.top` 下载并校验 GOST；
-4. 为当前线路生成独立的 systemd unit；
-5. 执行 `systemctl daemon-reload`；
-6. `enable --now` 当前线路的主服务和 Watchdog；
-7. 确认两个服务保持 `active`，并打印准确的配置、状态及事件日志路径。
-
-**CN 安装完成后会自动启动对应的主服务与 Watchdog，不需要再手动执行启动命令。** Anchor 不会被 enable，它仍由 Prewarm/Watchdog 按需控制。
-
-## 五、安装后按需修改业务后端
-
-安装器会使用当前线路 YAML 中已有的后端地址；新线路从模板继承的默认值为：
-
-```yaml
+# 修改后端地址
 forwarder:
   nodes:
   - name: backend
-    addr: 127.0.0.1:2345
+    addr: 127.0.0.1:8080  # 改为实际地址
+
+# 重启服务
+systemctl restart gost-mtcp-de.service
 ```
 
-这个地址表示：**由 Remote 去连接的最终 TCP 目标**。
-
-- 后端就在 Remote 本机：可以填写 `127.0.0.1:<PORT>`；
-- 后端在 Remote 能访问的其他机器：填写该机器的 IP 和端口；
-- 它不是 CN 本机的后端地址。
-
-如果线路别名是 `de`：
+### 修改 RTT 阈值
 
 ```bash
-nano /root/9929-gost-mtcp/cn/instances/de/cn.yaml
+nano /opt/gost-mtcp/cn/mtcp.conf
+
+# 修改阈值
+ACCEPT_RTT_MS=35
+
+# 重启 Watchdog
+systemctl restart gost-mtcp-de-watchdog.service
 ```
 
-如果使用默认线路：
+### 多线路部署
+
+同一台 CN 可以连接多个 Remote，每次执行 `install.sh cn` 并输入不同的线路别名：
 
 ```bash
-nano /root/9929-gost-mtcp/cn/cn.yaml
+# 第一条线路
+bash standalone-install.sh cn
+# 别名: de, 业务端口: 12000, Anchor: 12001
+
+# 第二条线路
+bash standalone-install.sh cn
+# 别名: us, 业务端口: 12002, Anchor: 12003
 ```
 
-找到 `name: backend`，将 `addr` 改成实际目标，例如：
+## 重要注意事项
 
-```yaml
-- name: backend
-  addr: 127.0.0.1:8080
-```
+⚠️ **Remote 防火墙必须配置**
 
-RTT 阈值已经由安装器交互写入 `mtcp.conf`，通常不需要再手动编辑。含义是新 MTCP outer 的 `minrtt` 必须小于 `ACCEPT_RTT_MS` 才进入 `FAST`。
-
-如果修改了业务后端，重启当前线路主服务让 GOST 重新加载 YAML。别名为 `de` 时：
+Remote 的 MTCP Relay 没有应用层认证，**不要对全网开放**。在防火墙中只允许 CN 的公网 IP 访问 MTCP 端口：
 
 ```bash
-systemctl restart 9929-gost-mtcp-de.service
+# UFW 示例
+ufw allow from <CN_IP> to any port 6600 proto tcp
 ```
 
-使用默认线路时：
+⚠️ **不要 enable CN 的 Anchor unit**
+
+Anchor 必须由 Prewarm/Watchdog 控制，不要手动启动或 enable：
 
 ```bash
-systemctl restart 9929-gost-mtcp.service
+# ❌ 错误
+systemctl enable gost-mtcp-de-anchor.service
+
+# ✓ 正确（安装器已自动配置）
+systemctl enable gost-mtcp-de.service
+systemctl enable gost-mtcp-de-watchdog.service
 ```
 
-Watchdog 会检测 GOST PID 变化并重新执行路径优选。
+⚠️ **hard failure 无法无缝续传**
 
-## 六、自动启动与服务管理
+如果 outer TCP 真正断开、GOST 被 kill 或 Remote 失联，已有业务 TCP 无法迁移到新 outer，只能等客户端重连。Watchdog 保证的是快速恢复新连接。
 
-安装器已经自动 enable 并启动当前线路的主服务和 Watchdog。别名为 `de` 时可以这样确认：
+⚠️ **单文件安装器 vs 传统方式**
 
-```bash
-systemctl is-enabled 9929-gost-mtcp-de.service
-systemctl is-active 9929-gost-mtcp-de.service
-systemctl is-enabled 9929-gost-mtcp-de-watchdog.service
-systemctl is-active 9929-gost-mtcp-de-watchdog.service
-```
+| 方案 | 优势 | 适用场景 |
+|------|------|----------|
+| **单文件安装器** | 下载快、无需 Git、一行命令 | 生产部署、批量安装 |
+| **传统方式** | 可查看完整文档和设计 | 开发调试、学习研究 |
 
-使用默认线路时：
-
-```bash
-systemctl is-enabled 9929-gost-mtcp.service
-systemctl is-active 9929-gost-mtcp.service
-systemctl is-enabled 9929-gost-mtcp-watchdog.service
-systemctl is-active 9929-gost-mtcp-watchdog.service
-```
-
-> **不要 enable 或手动常驻启动 Anchor unit。**
->
-> Anchor 必须由 Prewarm/Watchdog 控制。提前启动可能随机建立并锁住一条未经优选的慢路。
-
-根据业务需要，在 CN 防火墙或安全组中放行业务监听端口（默认 `12000/tcp`）。Anchor 端口默认 `12001/tcp`，只监听 `127.0.0.1`，不需要对外开放。
-
-## 七、验证安装结果
-
-### 1. 检查 Remote
-
-```bash
-systemctl is-active 9929-gost-mtcp-remote.service
-systemctl is-active 9929-gost-mtcp-remote-anchor-endpoint.service
-ss -lntp | grep -E ':6600|:12346'
-```
-
-### 2. 检查 CN 别名线路 `de`
-
-别名线路的状态目录规则是：
-
-```text
-/root/9929-gost-mtcp/cn/instances/<别名>/state/
-```
-
-别名为 `de` 时，准确命令是：
-
-```bash
-systemctl status 9929-gost-mtcp-de.service --no-pager
-systemctl status 9929-gost-mtcp-de-watchdog.service --no-pager
-cat /root/9929-gost-mtcp/cn/instances/de/state/status.json
-tail -n 30 /root/9929-gost-mtcp/cn/instances/de/state/events.jsonl
-journalctl -u 9929-gost-mtcp-de-watchdog.service -n 100 --no-pager
-```
-
-### 3. 检查 CN 默认线路
-
-```bash
-systemctl status 9929-gost-mtcp.service --no-pager
-systemctl status 9929-gost-mtcp-watchdog.service --no-pager
-cat /root/9929-gost-mtcp/cn/state/status.json
-tail -n 30 /root/9929-gost-mtcp/cn/state/events.jsonl
-```
-
-正常状态应接近：
-
-```text
-state = FAST
-outer_count = 1
-minrtt_ms < ACCEPT_RTT_MS
-anchor_state = up
-anchor_connections = 1
-```
-
-状态含义：
+## 状态说明
 
 | 状态 | 含义 |
-| --- | --- |
-| `FAST` | 唯一 outer、Anchor 正常且路径满足准入阈值 |
-| `DEGRADED` | 当前连接可用，但路径、Anchor 或 TCP 信息未达到快速状态 |
-| `DOWN` | GOST、outer 或 Remote 不可用 |
-| `FAULT` | outer 数量异常或优选过程发生明确故障 |
+|------|------|
+| `FAST` | 唯一 outer、Anchor 正常、路径满足阈值 |
+| `DEGRADED` | 连接可用但未达最佳（路径慢、Anchor 异常等） |
+| `DOWN` | GOST/outer/Remote 不可用 |
+| `FAULT` | outer 数量异常或优选过程故障 |
 
-查看 CN 到 Remote 的 outer（替换实际地址和端口）：
-
-```bash
-ss -tin state established "dst <REMOTE_IP> dport = :6600"
-```
-
-正常模型应只有一条有效的 MTCP outer TCP。
-
-## 八、使用交互角色菜单
-
-不带参数执行也可以：
+## 故障排查
 
 ```bash
-bash install.sh
+# 查看服务日志
+journalctl -u gost-mtcp-de.service -n 100
+journalctl -u gost-mtcp-de-watchdog.service -n 100
+
+# 查看状态
+cat /opt/gost-mtcp/cn/state/status.json | jq
+
+# 查看事件历史
+tail -n 50 /opt/gost-mtcp/cn/state/events.jsonl
+
+# 检查 Remote 连通性
+timeout 2 bash -c "exec 3<>/dev/tcp/<REMOTE_IP>/6600" && echo "OK" || echo "FAIL"
 ```
 
-菜单会询问“当前这台服务器”承担哪个角色：
+## 工作原理
 
-```text
-1) CN      中国大陆入口端
-2) Remote  境外中转端
-q) 退出
-```
+v2.2 采用 **Prewarm + Anchor + Watchdog** 三层架构：
 
-直接指定角色更适合照文档部署：
-
-```bash
-bash install.sh remote
-bash install.sh cn
-```
-
-查看帮助不需要 root：
-
-```bash
-bash install.sh --help
-```
-
-指定其他 GOST 版本：
-
-```bash
-GOST_VERSION=v3.2.6 bash install.sh remote
-GOST_VERSION=v3.2.6 bash install.sh cn
-```
-
-安装器会按照版本号构造官方 Release 文件名；使用其他版本前请自行确认兼容性。
-
-### GitHub 下载镜像规则
-
-- CN 安装默认使用：
-
-  ```text
-  https://ghfast.top/https://github.com/go-gost/gost/releases/...
-  ```
-
-- Remote 安装默认直连 GitHub；
-- 下载的压缩包仍会和同一来源的 `checksums.txt` 做 SHA-256 校验；
-- CN 临时强制直连 GitHub：
-
-  ```bash
-  GITHUB_PROXY_PREFIX= bash install.sh cn
-  ```
-
-- Remote 也需要通过 ghfast 下载时：
-
-  ```bash
-  GITHUB_PROXY_PREFIX=https://ghfast.top/ bash install.sh remote
-  ```
-
-- 使用其他兼容镜像前缀时：
-
-  ```bash
-  GITHUB_PROXY_PREFIX=https://your-mirror.example/ bash install.sh cn
-  ```
-
-镜像前缀必须采用“前缀 + 完整上游 HTTPS URL”的形式。
-
-## 九、添加多个 Remote
-
-同一台 CN 可以连接多个 Remote。每增加一条线路，再执行一次：
-
-```bash
-bash install.sh cn
-```
-
-为每条线路填写不同别名和不同的 CN 本地端口，例如：
-
-| 别名 | Remote | CN 业务端口 | CN Anchor 端口 |
-| --- | --- | ---: | ---: |
-| `de` | 德国 Remote | `12000` | `12001` |
-| `us` | 美国 Remote | `12002` | `12003` |
-
-安装器会检查已生成线路之间的业务端口和 Anchor 端口冲突。每条线路都有独立配置、状态、运行锁和三个 systemd unit，但共享 `cn/gost` 二进制。
-
-## 十、重装与升级
-
-### 重装 Remote
-
-重新执行：
-
-```bash
-bash install.sh remote
-```
-
-安装器会重新下载 GOST、生成 unit，并 restart Remote 服务。现有 MTCP 连接会短暂中断。
-
-### 重装某条 CN 线路
-
-如果线路仍在运行，安装器会拒绝修改配置。先停止该线路的 Watchdog、Anchor 和主服务，再使用同一个别名重装。
-
-以 `de` 为例：
-
-```bash
-systemctl stop \
-  9929-gost-mtcp-de-watchdog.service \
-  9929-gost-mtcp-de-anchor.service \
-  9929-gost-mtcp-de.service
-
-bash install.sh cn
-# 再次输入别名 de
-```
-
-安装器会复用已有线路配置，保留后端地址；Remote、端口和 RTT 阈值会按交互输入更新。重装完成后，主服务与 Watchdog 会自动重新启用并启动。
-
-### 更新项目代码
-
-```bash
-cd /root/9929-gost-mtcp
-git status
-git pull --ff-only
-```
-
-如果 CN 最初是从 GitHub 直连地址克隆的，可以将远端改为 ghfast：
-
-```bash
-git remote set-url origin https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
-git pull --ff-only
-```
-
-先确认没有准备提交的本地生产配置。拉取代码后，对需要更新的角色重新运行根目录 `install.sh`。
-
-## 十一、工作原理
-
-本项目由三个 CN 侧组件配合：
-
-- **Prewarm**：建立候选 outer，读取 TCP `minrtt`，慢路会被淘汰并重抽；
-- **Anchor**：在选中路径上保持轻量 logical stream，避免空闲时 outer 消失；
-- **Watchdog**：监控 GOST PID、outer 数量、Anchor 和 Remote 可达性，在明确故障恢复后重新优选。
+- **Prewarm** - 启动时建立候选 outer，读取 TCP `minrtt`，慢路淘汰并重抽直到抽中快路
+- **Anchor** - 在选中路径上保持轻量 logical stream，避免空闲时 outer 消失
+- **Watchdog** - 监控 GOST PID、outer 数量、Anchor 和 Remote 可达性，明确故障后自动重新优选
 
 设计原则：
+- 新 outer 用 `minrtt` 判断基础路径
+- 运行中的 current RTT 只用于状态和告警，不因瞬时拥塞直接踢掉当前连接
+- Remote 不可达时安静等待，不循环重启
+- 始终维持唯一一条 MTCP outer TCP
 
-- 新 outer 使用 `minrtt` 判断基础路径；
-- 运行中的 current RTT 只用于状态和告警，不因瞬时拥塞直接踢掉当前连接；
-- Remote 不可达时安静等待，不循环重启和刷日志；
-- 始终尽量维持唯一一条 MTCP outer TCP；
-- outer 真正断开、GOST 被强制终止或 Remote 失联时，已有业务 TCP 无法无缝迁移，只能等待客户端重新连接。
+详细设计背景见 `DESIGN-archive.md`。
 
-MTCP 默认参数位于 `cn/cn.yaml` 和 `remote/remote.yaml`：
+## 目录结构
 
-```text
-mux.version: 2
-mux.keepaliveInterval: 10s
-mux.keepaliveTimeout: 30s
-mux.maxFrameSize: 32768
-mux.maxReceiveBuffer: 33554432
-mux.maxStreamBuffer: 4194304
 ```
-
-## 十二、目录结构
-
-```text
 9929-gost-mtcp/
-├── install.sh                         # 唯一安装入口
-├── README.md
-├── README-quickstart.txt
-├── DESIGN-archive.md                  # 历史设计讨论，不是部署指南
-├── cn/
-│   ├── cn.yaml                        # CN 默认线路模板/配置
-│   ├── mtcp.conf                      # Watchdog 默认参数
+├── standalone-install.sh      # 单文件自包含安装器
+├── install.sh                  # 传统安装器（需要完整项目）
+├── cn/                         # CN 端配置和脚本
+│   ├── cn.yaml
+│   ├── mtcp.conf
 │   ├── mtcp-lib.sh
 │   ├── mtcp-prewarm.sh
 │   ├── mtcp-watchdog.sh
-│   ├── 9929-gost-mtcp.service
-│   ├── 9929-gost-mtcp-anchor.service
-│   ├── 9929-gost-mtcp-watchdog.service
-│   ├── instances/                     # 别名线路安装后自动生成
-│   │   └── <alias>/
-│   │       ├── cn.yaml
-│   │       ├── mtcp.conf
-│   │       └── state/
-│   └── state/                         # 默认线路状态
-└── remote/
+│   └── *.service
+└── remote/                     # Remote 端配置
     ├── remote.yaml
-    ├── 9929-gost-mtcp-remote.service
-    └── 9929-gost-mtcp-remote-anchor-endpoint.service
+    └── *.service
 ```
 
-本地开发校验：
+## 许可证
 
-```bash
-bash -n install.sh cn/*.sh
-shellcheck -x install.sh cn/*.sh
-```
-
-更早期的设计背景和故障测试记录见 `DESIGN-archive.md`；实际安装与运维以本 README 和当前代码为准。
+MIT
