@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG="${1:-/root/9929-gost-mtcp/cn/mtcp.conf}"
-LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
+CONFIG="${1:-/root/gost-ecmp-pathlock/cn/mtcp.conf}"
+LIB="${MTCP_LIB:-/root/gost-ecmp-pathlock/cn/mtcp-lib.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 30

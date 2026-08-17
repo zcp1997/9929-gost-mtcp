@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG_DEFAULT="/root/9929-gost-mtcp/cn/mtcp.conf"
+CONFIG_DEFAULT="/root/gost-ecmp-pathlock/cn/mtcp.conf"
 CONFIG_KEYS=(
     UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
@@ -40,7 +40,7 @@ load_config() {
         fi
     done
 
-    STATE_DIR="${STATE_DIR:-/root/9929-gost-mtcp/cn/state}"
+    STATE_DIR="${STATE_DIR:-/root/gost-ecmp-pathlock/cn/state}"
     STATE_FILE="${STATE_FILE:-${STATE_DIR}/runtime.state}"
     STATUS_JSON="${STATUS_JSON:-${STATE_DIR}/status.json}"
     EVENT_FILE="${EVENT_FILE:-${STATE_DIR}/events.jsonl}"

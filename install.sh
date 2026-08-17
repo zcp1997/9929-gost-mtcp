@@ -9,7 +9,7 @@ SELECTED_ROLE=""
 show_banner() {
     cat <<'EOF'
 ============================================================
-  9929-gost-mtcp 统一安装向导
+  gost-ecmp-pathlock 统一安装向导
 ============================================================
 EOF
 }
@@ -160,9 +160,9 @@ install_cn() {
     YAML_CONFIG="$CN_DIR/cn.yaml"
     MTCP_CONFIG="$CN_DIR/mtcp.conf"
     STATE_DIR_PATH="$CN_DIR/state"
-    MAIN_UNIT="9929-gost-mtcp.service"
-    ANCHOR_UNIT="9929-gost-mtcp-anchor.service"
-    WATCHDOG_UNIT="9929-gost-mtcp-watchdog.service"
+    MAIN_UNIT="gost-ecmp-pathlock.service"
+    ANCHOR_UNIT="gost-ecmp-pathlock-anchor.service"
+    WATCHDOG_UNIT="gost-ecmp-pathlock-watchdog.service"
     REMOTE_IP=""
     REMOTE_PORT=""
     BUSINESS_PORT=""
@@ -263,9 +263,9 @@ install_cn() {
             YAML_CONFIG="$INSTANCE_DIR/cn.yaml"
             MTCP_CONFIG="$INSTANCE_DIR/mtcp.conf"
             STATE_DIR_PATH="$INSTANCE_DIR/state"
-            MAIN_UNIT="9929-gost-mtcp-${REMOTE_ALIAS}.service"
-            ANCHOR_UNIT="9929-gost-mtcp-${REMOTE_ALIAS}-anchor.service"
-            WATCHDOG_UNIT="9929-gost-mtcp-${REMOTE_ALIAS}-watchdog.service"
+            MAIN_UNIT="gost-ecmp-pathlock-${REMOTE_ALIAS}.service"
+            ANCHOR_UNIT="gost-ecmp-pathlock-${REMOTE_ALIAS}-anchor.service"
+            WATCHDOG_UNIT="gost-ecmp-pathlock-${REMOTE_ALIAS}-watchdog.service"
         fi
     }
 
@@ -368,7 +368,7 @@ install_cn() {
         PORT_CONFLICT_CONFIG=""
         PORT_CONFLICT_KEY=""
         if [[ "$MTCP_CONFIG" != "$CN_DIR/mtcp.conf" ]] &&
-           [[ -e "$SYSTEMD_DIR/9929-gost-mtcp.service" || -L "$SYSTEMD_DIR/9929-gost-mtcp.service" ]]; then
+           [[ -e "$SYSTEMD_DIR/gost-ecmp-pathlock.service" || -L "$SYSTEMD_DIR/gost-ecmp-pathlock.service" ]]; then
             configs+=("$CN_DIR/mtcp.conf")
         fi
         for config in "$CN_DIR"/instances/*/mtcp.conf; do
@@ -595,9 +595,9 @@ install_cn() {
         local role="$1" destination="$2" template tmp description_suffix=""
 
         case "$role" in
-            main) template="$CN_DIR/9929-gost-mtcp.service" ;;
-            anchor) template="$CN_DIR/9929-gost-mtcp-anchor.service" ;;
-            watchdog) template="$CN_DIR/9929-gost-mtcp-watchdog.service" ;;
+            main) template="$CN_DIR/gost-ecmp-pathlock.service" ;;
+            anchor) template="$CN_DIR/gost-ecmp-pathlock-anchor.service" ;;
+            watchdog) template="$CN_DIR/gost-ecmp-pathlock-watchdog.service" ;;
             *) echo "未知 unit 类型: $role" >&2; exit 1 ;;
         esac
         [[ -r "$template" ]] || { echo "unit 模板不可读: $template" >&2; exit 1; }
@@ -629,15 +629,15 @@ install_cn() {
                     line = line description_suffix
                 }
                 if (role == "main") {
-                    line = replace_literal(line, "/root/9929-gost-mtcp/cn/cn.yaml", yaml_config)
+                    line = replace_literal(line, "/root/gost-ecmp-pathlock/cn/cn.yaml", yaml_config)
                 } else if (role == "anchor") {
-                    line = replace_literal(line, "9929-gost-mtcp.service", main_unit)
+                    line = replace_literal(line, "gost-ecmp-pathlock.service", main_unit)
                     line = replace_literal(line, "/dev/tcp/127.0.0.1/12001", "/dev/tcp/127.0.0.1/" anchor_port)
                 } else if (role == "watchdog") {
-                    line = replace_literal(line, "9929-gost-mtcp.service", main_unit)
-                    line = replace_literal(line, "/root/9929-gost-mtcp/cn/mtcp.conf", mtcp_config)
+                    line = replace_literal(line, "gost-ecmp-pathlock.service", main_unit)
+                    line = replace_literal(line, "/root/gost-ecmp-pathlock/cn/mtcp.conf", mtcp_config)
                 }
-                line = replace_literal(line, "/root/9929-gost-mtcp/cn", cn_dir)
+                line = replace_literal(line, "/root/gost-ecmp-pathlock/cn", cn_dir)
                 print line
             }
         ' "$template" > "$tmp" || {
@@ -771,7 +771,7 @@ install_cn() {
     systemctl daemon-reload
     enable_and_start_cn_units
 
-    echo "9929-gost-mtcp CN → Remote 线路 ${ROUTE_LABEL} 已安装并启动。"
+    echo "gost-ecmp-pathlock CN → Remote 线路 ${ROUTE_LABEL} 已安装并启动。"
     echo "配置文件: $YAML_CONFIG, $MTCP_CONFIG"
     echo "运行服务: $MAIN_UNIT, $WATCHDOG_UNIT"
     echo "状态文件: $STATE_DIR_PATH/status.json"
@@ -788,8 +788,8 @@ install_remote() {
     REMOTE_DIR="$BASE/remote"
     SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
     REMOTE_CONFIG="$REMOTE_DIR/remote.yaml"
-    MAIN_UNIT="9929-gost-mtcp-remote.service"
-    ANCHOR_UNIT="9929-gost-mtcp-remote-anchor-endpoint.service"
+    MAIN_UNIT="gost-ecmp-pathlock-remote.service"
+    ANCHOR_UNIT="gost-ecmp-pathlock-remote-anchor-endpoint.service"
     GOST_REPO="go-gost/gost"
     GOST_VERSION="${GOST_VERSION:-v3.2.6}"
     GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX-}"
@@ -849,7 +849,7 @@ install_remote() {
         local unit_file target relative role_dir unit_name
         local -a unit_files=()
 
-        for unit_file in "$SYSTEMD_DIR"/9929-gost-mtcp*.service; do
+        for unit_file in "$SYSTEMD_DIR"/gost-ecmp-pathlock*.service; do
             [[ -L "$unit_file" ]] && unit_files+=("$unit_file")
         done
         (( ${#unit_files[@]} > 0 )) || return 0
@@ -1035,8 +1035,8 @@ install_remote() {
         local role="$1" destination="$2" template tmp
 
         case "$role" in
-            main) template="$REMOTE_DIR/9929-gost-mtcp-remote.service" ;;
-            anchor) template="$REMOTE_DIR/9929-gost-mtcp-remote-anchor-endpoint.service" ;;
+            main) template="$REMOTE_DIR/gost-ecmp-pathlock-remote.service" ;;
+            anchor) template="$REMOTE_DIR/gost-ecmp-pathlock-remote-anchor-endpoint.service" ;;
             *) echo "未知 unit 类型: $role" >&2; exit 1 ;;
         esac
         [[ -r "$template" ]] || { echo "unit 模板不可读: $template" >&2; exit 1; }
@@ -1054,7 +1054,7 @@ install_remote() {
                 return result text
             }
             {
-                line = replace_literal($0, "/root/9929-gost-mtcp/remote", remote_dir)
+                line = replace_literal($0, "/root/gost-ecmp-pathlock/remote", remote_dir)
                 line = replace_literal(line, "/usr/bin/socat", socat_bin)
                 print line
             }
@@ -1086,7 +1086,7 @@ install_remote() {
     systemctl restart "$MAIN_UNIT"
     systemctl restart "$ANCHOR_UNIT"
 
-    echo "9929-gost-mtcp Remote 端安装完成，MTCP 监听端口: $LISTEN_PORT/tcp"
+    echo "gost-ecmp-pathlock Remote 端安装完成，MTCP 监听端口: $LISTEN_PORT/tcp"
     echo "服务: $MAIN_UNIT, $ANCHOR_UNIT"
 }
 

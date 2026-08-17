@@ -198,7 +198,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 cp cn/mtcp.conf "$tmp_dir/mtcp.conf"
 sed -i.bak 's/^BUSINESS_PORTS=.*/BUSINESS_PORTS="12000,12002 12000"/' "$tmp_dir/mtcp.conf"
 rm -f "$tmp_dir/mtcp.conf.bak"
-sed -i.bak "s|/root/9929-gost-mtcp/cn/state|$tmp_dir/state|g" "$tmp_dir/mtcp.conf"
+sed -i.bak "s|/root/gost-ecmp-pathlock/cn/state|$tmp_dir/state|g" "$tmp_dir/mtcp.conf"
 rm -f "$tmp_dir/mtcp.conf.bak"
 
 # shellcheck disable=SC1091

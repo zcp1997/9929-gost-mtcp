@@ -1,7 +1,7 @@
 [Unit]
-Description=9929 GOST MTCP v1 Anchor Stream
-After=9929-gost-mtcp.service
-Requires=9929-gost-mtcp.service
+Description=GOST ECMP PathLock Anchor Stream
+After=gost-ecmp-pathlock.service
+Requires=gost-ecmp-pathlock.service
 StartLimitIntervalSec=0
 
 [Service]

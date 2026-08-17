@@ -1,4 +1,4 @@
-9929-gost-mtcp quick start
+gost-ecmp-pathlock quick start
 
 项目只有一个安装入口：根目录 install.sh。
 CN 和 Remote 目录下没有、也不需要单独的安装脚本。
@@ -10,14 +10,14 @@ CN 和 Remote 目录下没有、也不需要单独的安装脚本。
 下载项目：
 
   CN（中国大陆，走 ghfast）：
-    git clone https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
+    git clone https://ghfast.top/https://github.com/zcp1997/gost-ecmp-pathlock.git
 
   Remote（境外，直连 GitHub）：
-    git clone https://github.com/zcp1997/9929-gost-mtcp.git
+    git clone https://github.com/zcp1997/gost-ecmp-pathlock.git
 
 两台服务器进入项目根目录后执行：
 
-  cd /root/9929-gost-mtcp
+  cd /root/gost-ecmp-pathlock
   bash install.sh
 
 根据当前服务器选择：
@@ -39,7 +39,7 @@ de、us 是 Remote 节点/线路别名，不是 CN 地区。
 多条 Remote 线路必须使用不同的 CN 业务端口和 Anchor 端口。
 
 别名 de 的事件日志：
-  tail -n 30 /root/9929-gost-mtcp/cn/instances/de/state/events.jsonl
+  tail -n 30 /root/gost-ecmp-pathlock/cn/instances/de/state/events.jsonl
 
 不要 enable CN 的 Anchor unit，它必须由 Prewarm/Watchdog 控制。
 详细说明见 README.md。

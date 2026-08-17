@@ -31,13 +31,13 @@ emit_file() {
 }
 
 emit_file REMOTE_YAML remote/remote.yaml
-emit_file REMOTE_MAIN_SERVICE remote/9929-gost-mtcp-remote.service
-emit_file REMOTE_ANCHOR_SERVICE remote/9929-gost-mtcp-remote-anchor-endpoint.service
+emit_file REMOTE_MAIN_SERVICE remote/gost-ecmp-pathlock-remote.service
+emit_file REMOTE_ANCHOR_SERVICE remote/gost-ecmp-pathlock-remote-anchor-endpoint.service
 emit_file CN_YAML cn/cn.yaml
 emit_file CN_MTCP_CONF cn/mtcp.conf
-emit_file CN_MAIN_SERVICE cn/9929-gost-mtcp.service
-emit_file CN_ANCHOR_SERVICE cn/9929-gost-mtcp-anchor.service
-emit_file CN_WATCHDOG_SERVICE cn/9929-gost-mtcp-watchdog.service
+emit_file CN_MAIN_SERVICE cn/gost-ecmp-pathlock.service
+emit_file CN_ANCHOR_SERVICE cn/gost-ecmp-pathlock-anchor.service
+emit_file CN_WATCHDOG_SERVICE cn/gost-ecmp-pathlock-watchdog.service
 emit_file CN_LIB cn/mtcp-lib.sh
 emit_file CN_PREWARM cn/mtcp-prewarm.sh
 emit_file CN_WATCHDOG cn/mtcp-watchdog.sh

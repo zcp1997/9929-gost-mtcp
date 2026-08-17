@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-DEFAULT_CONFIG="${MTCP_CONFIG:-/root/9929-gost-mtcp/cn/mtcp.conf}"
+DEFAULT_CONFIG="${MTCP_CONFIG:-/root/gost-ecmp-pathlock/cn/mtcp.conf}"
 CONFIG="${1:-$DEFAULT_CONFIG}"
 ADOPT_MODE=0
 if [[ "${1:-}" == "--adopt" ]]; then
@@ -11,8 +11,8 @@ elif [[ "${2:-}" == "--adopt" ]]; then
     ADOPT_MODE=1
 fi
 
-LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
-PREWARM="${MTCP_PREWARM:-/root/9929-gost-mtcp/cn/mtcp-prewarm.sh}"
+LIB="${MTCP_LIB:-/root/gost-ecmp-pathlock/cn/mtcp-lib.sh}"
+PREWARM="${MTCP_PREWARM:-/root/gost-ecmp-pathlock/cn/mtcp-prewarm.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 1

@@ -1,4 +1,4 @@
-# 9929-gost-mtcp：原始方案讨论归档
+# gost-ecmp-pathlock：原始方案讨论归档
 
 v1 主要解决的是一个问题：
 

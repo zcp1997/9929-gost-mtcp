@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 9929-gost-mtcp 自包含安装器
+# gost-ecmp-pathlock 自包含安装器
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s remote
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s cn
@@ -37,7 +37,7 @@ trap cleanup EXIT
 show_banner() {
     cat <<'BANNER'
 ============================================================
-  9929-gost-mtcp 自包含安装器 v1.2.0
+  gost-ecmp-pathlock 自包含安装器 v1.2.0
 
   基于 GOST MTCP 的 ECMP 低延迟路径优选方案
 ============================================================
@@ -338,10 +338,10 @@ install_remote() {
     anchor_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote-anchor.XXXXXX")"
     CLEANUP_PATHS+=("$main_tmp" "$anchor_tmp")
     extract_embedded REMOTE_MAIN_SERVICE | sed \
-        -e "s|/root/9929-gost-mtcp/remote|$remote_dir|g" \
+        -e "s|/root/gost-ecmp-pathlock/remote|$remote_dir|g" \
         > "$main_tmp"
     extract_embedded REMOTE_ANCHOR_SERVICE | sed \
-        -e "s|9929-gost-mtcp-remote.service|$main_unit|g" \
+        -e "s|gost-ecmp-pathlock-remote.service|$main_unit|g" \
         -e "s|/usr/bin/socat|$socat_bin|g" \
         > "$anchor_tmp"
     chmod 0644 "$main_tmp" "$anchor_tmp"
@@ -466,9 +466,9 @@ install_cn() {
     prewarm_tmp="$(mktemp "$cn_dir/.mtcp-prewarm.XXXXXX")"
     watchdog_tmp="$(mktemp "$cn_dir/.mtcp-watchdog.XXXXXX")"
     CLEANUP_PATHS+=("$lib_tmp" "$prewarm_tmp" "$watchdog_tmp")
-    extract_embedded CN_LIB | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$lib_tmp"
-    extract_embedded CN_PREWARM | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$prewarm_tmp"
-    extract_embedded CN_WATCHDOG | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$watchdog_tmp"
+    extract_embedded CN_LIB | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$lib_tmp"
+    extract_embedded CN_PREWARM | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$prewarm_tmp"
+    extract_embedded CN_WATCHDOG | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$watchdog_tmp"
     chmod 0755 "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp"
     mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh"; mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh"
     mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh"
@@ -485,10 +485,10 @@ install_cn() {
         { print }
     ' > "$main_tmp"
     extract_embedded CN_ANCHOR_SERVICE | sed \
-        -e "s|9929-gost-mtcp.service|$main_unit|g" \
+        -e "s|gost-ecmp-pathlock.service|$main_unit|g" \
         -e "s|/dev/tcp/127.0.0.1/12001|/dev/tcp/127.0.0.1/$anchor_port|g" > "$anchor_tmp"
-    extract_embedded CN_WATCHDOG_SERVICE | awk -v canonical="9929-gost-mtcp.service" -v main="$main_unit" \
-        -v root="/root/9929-gost-mtcp/cn" -v cn="$cn_dir" -v wd="$instance_dir" \
+    extract_embedded CN_WATCHDOG_SERVICE | awk -v canonical="gost-ecmp-pathlock.service" -v main="$main_unit" \
+        -v root="/root/gost-ecmp-pathlock/cn" -v cn="$cn_dir" -v wd="$instance_dir" \
         -v config="$instance_dir/mtcp.conf" '
         function repl(s,a,b) { while ((p=index(s,a))>0) s=substr(s,1,p-1) b substr(s,p+length(a)); return s }
         { line=repl($0,canonical,main); line=repl(line,root "/mtcp.conf",config); line=repl(line,root,cn)
@@ -937,7 +937,7 @@ main() {
             exit 0
             ;;
         --version|-v)
-            echo "9929-gost-mtcp standalone installer v${VERSION}"
+            echo "gost-ecmp-pathlock standalone installer v${VERSION}"
             exit 0
             ;;
         cn|remote)
@@ -997,7 +997,7 @@ services:
 
 ### BEGIN REMOTE_MAIN_SERVICE ###
 [Unit]
-Description=9929 GOST MTCP v1 Remote Server
+Description=GOST ECMP PathLock Remote Server
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -1005,10 +1005,10 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/root/9929-gost-mtcp/remote
-ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/remote/gost
-ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/remote/remote.yaml
-ExecStart=/root/9929-gost-mtcp/remote/gost -D -C /root/9929-gost-mtcp/remote/remote.yaml
+WorkingDirectory=/root/gost-ecmp-pathlock/remote
+ExecStartPre=/usr/bin/test -x /root/gost-ecmp-pathlock/remote/gost
+ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/remote/remote.yaml
+ExecStart=/root/gost-ecmp-pathlock/remote/gost -D -C /root/gost-ecmp-pathlock/remote/remote.yaml
 Restart=always
 RestartSec=2
 TimeoutStopSec=15
@@ -1023,7 +1023,7 @@ WantedBy=multi-user.target
 
 ### BEGIN REMOTE_ANCHOR_SERVICE ###
 [Unit]
-Description=9929 GOST MTCP v1 Remote Anchor Endpoint
+Description=GOST ECMP PathLock Remote Anchor Endpoint
 After=network-online.target
 Wants=network-online.target
 
@@ -1093,8 +1093,8 @@ chains:
 # watchdog 每轮重新 source，本文件中的阈值修改后无需重启 watchdog。
 
 # ---- systemd / path ----
-UNIT="9929-gost-mtcp.service"
-ANCHOR_UNIT="9929-gost-mtcp-anchor.service"
+UNIT="gost-ecmp-pathlock.service"
+ANCHOR_UNIT="gost-ecmp-pathlock-anchor.service"
 DST="remote.example.invalid"
 PORT="6600"
 BUSINESS_PORT="12000"
@@ -1165,17 +1165,17 @@ PROCESS_RECOVERY_MAX="3"
 PROCESS_BREAKER_OPEN_SEC="600"
 
 # ---- state / retention ----
-STATE_DIR="/root/9929-gost-mtcp/cn/state"
-STATE_FILE="/root/9929-gost-mtcp/cn/state/runtime.state"
-STATUS_JSON="/root/9929-gost-mtcp/cn/state/status.json"
-EVENT_FILE="/root/9929-gost-mtcp/cn/state/events.jsonl"
+STATE_DIR="/root/gost-ecmp-pathlock/cn/state"
+STATE_FILE="/root/gost-ecmp-pathlock/cn/state/runtime.state"
+STATUS_JSON="/root/gost-ecmp-pathlock/cn/state/status.json"
+EVENT_FILE="/root/gost-ecmp-pathlock/cn/state/events.jsonl"
 RETENTION_SEC="86400"
 
 ### END CN_MTCP_CONF ###
 
 ### BEGIN CN_MAIN_SERVICE ###
 [Unit]
-Description=9929 GOST MTCP v1 Data Plane
+Description=GOST ECMP PathLock Data Plane
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -1183,10 +1183,10 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/root/9929-gost-mtcp/cn
-ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/cn/gost
-ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/cn/cn.yaml
-ExecStart=/root/9929-gost-mtcp/cn/gost -D -C /root/9929-gost-mtcp/cn/cn.yaml
+WorkingDirectory=/root/gost-ecmp-pathlock/cn
+ExecStartPre=/usr/bin/test -x /root/gost-ecmp-pathlock/cn/gost
+ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/cn.yaml
+ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/cn.yaml
 Restart=always
 RestartSec=2
 TimeoutStopSec=15
@@ -1201,9 +1201,9 @@ WantedBy=multi-user.target
 
 ### BEGIN CN_ANCHOR_SERVICE ###
 [Unit]
-Description=9929 GOST MTCP v1 Anchor Stream
-After=9929-gost-mtcp.service
-Requires=9929-gost-mtcp.service
+Description=GOST ECMP PathLock Anchor Stream
+After=gost-ecmp-pathlock.service
+Requires=gost-ecmp-pathlock.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -1225,20 +1225,20 @@ StandardError=journal
 
 ### BEGIN CN_WATCHDOG_SERVICE ###
 [Unit]
-Description=9929 GOST MTCP v1 Watchdog
-After=network-online.target 9929-gost-mtcp.service
-Wants=network-online.target 9929-gost-mtcp.service
+Description=GOST ECMP PathLock Watchdog
+After=network-online.target gost-ecmp-pathlock.service
+Wants=network-online.target gost-ecmp-pathlock.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
 Type=simple
-WorkingDirectory=/root/9929-gost-mtcp/cn
-Environment="MTCP_LIB=/root/9929-gost-mtcp/cn/mtcp-lib.sh"
-Environment="MTCP_PREWARM=/root/9929-gost-mtcp/cn/mtcp-prewarm.sh"
-ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/cn/mtcp.conf
-ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/cn/mtcp-watchdog.sh
-ExecStart=/root/9929-gost-mtcp/cn/mtcp-watchdog.sh /root/9929-gost-mtcp/cn/mtcp.conf
+WorkingDirectory=/root/gost-ecmp-pathlock/cn
+Environment="MTCP_LIB=/root/gost-ecmp-pathlock/cn/mtcp-lib.sh"
+Environment="MTCP_PREWARM=/root/gost-ecmp-pathlock/cn/mtcp-prewarm.sh"
+ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/mtcp.conf
+ExecStartPre=/usr/bin/test -x /root/gost-ecmp-pathlock/cn/mtcp-watchdog.sh
+ExecStart=/root/gost-ecmp-pathlock/cn/mtcp-watchdog.sh /root/gost-ecmp-pathlock/cn/mtcp.conf
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
@@ -1255,7 +1255,7 @@ WantedBy=multi-user.target
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG_DEFAULT="/root/9929-gost-mtcp/cn/mtcp.conf"
+CONFIG_DEFAULT="/root/gost-ecmp-pathlock/cn/mtcp.conf"
 CONFIG_KEYS=(
     UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
@@ -1294,7 +1294,7 @@ load_config() {
         fi
     done
 
-    STATE_DIR="${STATE_DIR:-/root/9929-gost-mtcp/cn/state}"
+    STATE_DIR="${STATE_DIR:-/root/gost-ecmp-pathlock/cn/state}"
     STATE_FILE="${STATE_FILE:-${STATE_DIR}/runtime.state}"
     STATUS_JSON="${STATUS_JSON:-${STATE_DIR}/status.json}"
     EVENT_FILE="${EVENT_FILE:-${STATE_DIR}/events.jsonl}"
@@ -1549,8 +1549,8 @@ write_status_json() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG="${1:-/root/9929-gost-mtcp/cn/mtcp.conf}"
-LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
+CONFIG="${1:-/root/gost-ecmp-pathlock/cn/mtcp.conf}"
+LIB="${MTCP_LIB:-/root/gost-ecmp-pathlock/cn/mtcp-lib.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 30
@@ -1757,7 +1757,7 @@ exit 20
 #!/usr/bin/env bash
 set -uo pipefail
 
-DEFAULT_CONFIG="${MTCP_CONFIG:-/root/9929-gost-mtcp/cn/mtcp.conf}"
+DEFAULT_CONFIG="${MTCP_CONFIG:-/root/gost-ecmp-pathlock/cn/mtcp.conf}"
 CONFIG="${1:-$DEFAULT_CONFIG}"
 ADOPT_MODE=0
 if [[ "${1:-}" == "--adopt" ]]; then
@@ -1767,8 +1767,8 @@ elif [[ "${2:-}" == "--adopt" ]]; then
     ADOPT_MODE=1
 fi
 
-LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
-PREWARM="${MTCP_PREWARM:-/root/9929-gost-mtcp/cn/mtcp-prewarm.sh}"
+LIB="${MTCP_LIB:-/root/gost-ecmp-pathlock/cn/mtcp-lib.sh}"
+PREWARM="${MTCP_PREWARM:-/root/gost-ecmp-pathlock/cn/mtcp-prewarm.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 1

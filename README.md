@@ -1,7 +1,11 @@
-<h1 align="center">9929-gost-mtcp</h1>
+<h1 align="center">GOST ECMP PathLock</h1>
 
 <p align="center">
-  <strong>上海 9929 → 软银日本线路的 TCP ECMP 快路优选与故障自愈</strong>
+  <strong>TCP ECMP-aware path selection, persistent flow locking and automatic self-healing over GOST MTCP.</strong>
+</p>
+
+<p align="center">
+  基于 GOST MTCP 的 TCP ECMP 路径优选、持久锁定与自动自愈方案
 </p>
 
 <p align="center">
@@ -11,7 +15,7 @@
 
 ---
 
-上海 9929 宽带到部分软银日本线路存在明显的 TCP per-flow ECMP: 同一个目的地址, 不同 TCP 连接可能被哈希到不同物理路径, 实测大致是快路 ~33ms、慢路 ~50-52ms。普通 TCP 代理每建一条新连接都要重新参与一次 ECMP 哈希, 所以延迟会在快慢路径之间随机跳。
+本项目源于一个真实线路问题: 上海 9929 → 软银日本存在明显的 TCP per-flow ECMP 路径分化, 同一个目的地址的不同 TCP 连接可能被哈希到不同物理路径, 实测大致是快路 ~33 ms、慢路 ~51 ms。普通 TCP 代理每建一条新连接都要重新参与一次 ECMP 哈希, 所以延迟会在快慢路径之间随机跳。
 
 这个项目的目标不是让线路本身变快, 而是:
 
@@ -72,7 +76,7 @@ Valid samples: 970 / 1000
 
 ## 架构
 
-![9929-gost-mtcp 架构图](assets/design_picture.jpg)
+![GOST ECMP PathLock 架构图](assets/design_picture.jpg)
 
 ```text
 +----------------+           +------------------------------------+    selected MTCP outer    +--------------------------------+
@@ -100,12 +104,12 @@ Valid samples: 970 / 1000
 
 ```bash
 # 1. 先装 Remote(境外服务器)
-curl -fsSL https://raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s remote
+curl -fsSL https://raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh | bash -s remote
 
 # 2. 记下 Remote 的公网 IPv4 和 MTCP 端口(默认 6600)
 
 # 3. 再装 CN(中国大陆服务器)
-curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s cn
+curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh | bash -s cn
 # 按提示输入 Remote IP、端口和 RTT 阈值(默认 40ms)
 ```
 
@@ -115,13 +119,13 @@ curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/9929-gost-mtcp/m
 
 ```bash
 # CN 服务器
-git clone https://ghfast.top/https://github.com/zcp1997/9929-gost-mtcp.git
-cd 9929-gost-mtcp
+git clone https://ghfast.top/https://github.com/zcp1997/gost-ecmp-pathlock.git
+cd gost-ecmp-pathlock
 bash install.sh cn
 
 # Remote 服务器
-git clone https://github.com/zcp1997/9929-gost-mtcp.git
-cd 9929-gost-mtcp
+git clone https://github.com/zcp1997/gost-ecmp-pathlock.git
+cd gost-ecmp-pathlock
 bash install.sh remote
 ```
 
@@ -184,7 +188,7 @@ ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 nano /opt/gost-mtcp/cn/instances/jp/cn.yaml
 
 # 或传统方式路径
-nano /root/9929-gost-mtcp/cn/cn.yaml
+nano /root/gost-ecmp-pathlock/cn/cn.yaml
 
 # 修改后端地址
 forwarder:
@@ -380,7 +384,7 @@ IFS= read -r -n 1 reply <&3 || exit 1
 ## 目录结构
 
 ```
-9929-gost-mtcp/
+gost-ecmp-pathlock/
 ├── standalone-install.sh      # 单文件自包含安装器
 ├── install.sh                  # 传统安装器(需要完整项目)
 ├── scripts/
