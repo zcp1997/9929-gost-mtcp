@@ -285,9 +285,13 @@ ensure_units_inactive() {
 }
 
 ensure_cn_port_available() {
-    local wanted="$1" current_config="$2" config values value
+    local wanted="$1" current_config="$2" target_unit="$3" config configured_unit values value
     for config in "$INSTALL_BASE"/cn/instances/*/mtcp.conf "$INSTALL_BASE"/cn/mtcp.conf; do
         [[ -f "$config" && "$config" != "$current_config" ]] || continue
+        configured_unit="$(read_config_value "$config" UNIT 2>/dev/null || true)"
+        # v1.1 standalone 使用 cn/mtcp.conf 平铺布局；同一 UNIT 表示正在迁移的旧实例，
+        # 不能把它自己的业务/Anchor 端口误判为另一条线路的冲突。
+        [[ "$configured_unit" == "$target_unit" ]] && continue
         values="$(awk -F= '
             $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
                 value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
@@ -402,8 +406,8 @@ install_cn() {
     remote_port=$((10#$remote_port)); business_port=$((10#$business_port)); anchor_port=$((10#$anchor_port))
     [[ "$business_port" != "$anchor_port" ]] || die "业务端口不能与 Anchor 端口相同"
     [[ "$rtt_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "RTT 阈值无效"
-    ensure_cn_port_available "$business_port" "$instance_dir/mtcp.conf"
-    ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf"
+    ensure_cn_port_available "$business_port" "$instance_dir/mtcp.conf" "$main_unit"
+    ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf" "$main_unit"
 
     download_gost cn "$cn_dir"
 

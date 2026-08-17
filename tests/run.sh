@@ -69,6 +69,12 @@ MOCK
         PROMPT_INDEX=$((PROMPT_INDEX + 1))
     }
 
+    mkdir -p "$INSTALL_BASE/cn"
+    cat > "$INSTALL_BASE/cn/mtcp.conf" <<'LEGACY'
+UNIT="gost-mtcp-jp.service"
+BUSINESS_PORT="45100"
+ANCHOR_PORT="45101"
+LEGACY
     PROMPTS=(jp 45.142.125.253 5201 45100 45101 40); PROMPT_INDEX=0
     install_cn >/dev/null
     PROMPTS=(us 198.51.100.20 6600 45102 45103 45); PROMPT_INDEX=0
