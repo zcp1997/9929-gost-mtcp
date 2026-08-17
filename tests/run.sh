@@ -75,8 +75,31 @@ UNIT="gost-mtcp-jp.service"
 BUSINESS_PORT="45100"
 ANCHOR_PORT="45101"
 LEGACY
+    awk '
+      /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
+        print "# standalone-relay: relay-45104"
+        print "- name: relay-45104"
+        print "  addr: :45104"
+        print "  handler:"
+        print "    type: tcp"
+        print "    chain: chain-mtcp"
+        print "  listener:"
+        print "    type: tcp"
+        print "  forwarder:"
+        print "    nodes:"
+        print "    - name: backend-45104"
+        print "      addr: 127.0.0.1:2347"
+        print ""
+        inserted=1
+      }
+      { print }
+    ' cn/cn.yaml > "$INSTALL_BASE/cn/cn.yaml"
     PROMPTS=(jp 45.142.125.253 5201 45100 45101 40); PROMPT_INDEX=0
     install_cn >/dev/null
+    grep -q 'name: relay-45104' "$INSTALL_BASE/cn/instances/jp/cn.yaml" || \
+        fail "legacy Relay was not preserved during migration"
+    grep -q '^BUSINESS_PORTS="45100 45104"$' "$INSTALL_BASE/cn/instances/jp/mtcp.conf" || \
+        fail "legacy Relay was not included in BUSINESS_PORTS"
     unset CN_INSTANCE CN_YAML_PATH CN_MTCP_CONFIG_PATH
     resolve_cn_relay_context
     [[ "$CN_RELAY_YAML" == "$INSTALL_BASE/cn/instances/jp/cn.yaml" ]] || \
@@ -100,9 +123,9 @@ LEGACY
     relay_candidate="$(mktemp "$jp/.relay-test.XXXXXX")"
     awk '
       /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
-        print "# standalone-relay: relay-45104"
-        print "- name: relay-45104"
-        print "  addr: :45104"
+        print "# standalone-relay: relay-45106"
+        print "- name: relay-45106"
+        print "  addr: :45106"
         print "  handler:"
         print "    type: tcp"
         print "    chain: chain-mtcp"
@@ -110,15 +133,15 @@ LEGACY
         print "    type: tcp"
         print "  forwarder:"
         print "    nodes:"
-        print "    - name: backend-45104"
-        print "      addr: 127.0.0.1:2347"
+        print "    - name: backend-45106"
+        print "      addr: 127.0.0.1:2349"
         print ""
         inserted=1
       }
       { print }
     ' "$CN_RELAY_YAML" > "$relay_candidate"
     apply_cn_relay_yaml "$relay_candidate" "relay integration test" >/dev/null
-    grep -q '^BUSINESS_PORTS="45100 45104"$' "$CN_RELAY_CONFIG" || \
+    grep -q '^BUSINESS_PORTS="45100 45104 45106"$' "$CN_RELAY_CONFIG" || \
         fail "Relay manager did not synchronize BUSINESS_PORTS"
 
     failed_candidate="$(mktemp "$jp/.relay-failure-test.XXXXXX")"
@@ -147,7 +170,7 @@ LEGACY
     set -e
     (( relay_failure_rc != 0 )) || fail "Relay failure simulation unexpectedly succeeded"
     ! grep -q '45105' "$CN_RELAY_YAML" || fail "Relay YAML rollback failed"
-    grep -q '^BUSINESS_PORTS="45100 45104"$' "$CN_RELAY_CONFIG" || fail "Relay config rollback failed"
+    grep -q '^BUSINESS_PORTS="45100 45104 45106"$' "$CN_RELAY_CONFIG" || fail "Relay config rollback failed"
 
     set +e
     ( PROMPTS=(jp); PROMPT_INDEX=0; install_cn >/dev/null 2>&1 )

@@ -374,7 +374,8 @@ install_cn() {
 
     local cn_dir="$INSTALL_BASE/cn" remote_alias remote_ip remote_port business_port anchor_port rtt_threshold
     local unit_prefix main_unit anchor_unit watchdog_unit instance_dir state_dir
-    local yaml_tmp conf_tmp lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
+    local yaml_template yaml_tmp conf_tmp business_ports legacy_unit
+    local lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
     mkdir -p "$cn_dir/instances"
 
     echo "配置参数:"; echo
@@ -411,10 +412,20 @@ install_cn() {
 
     download_gost cn "$cn_dir"
 
+    yaml_template="$(mktemp "$instance_dir/.cn.template.XXXXXX")"
     yaml_tmp="$(mktemp "$instance_dir/.cn.yaml.XXXXXX")"
     conf_tmp="$(mktemp "$instance_dir/.mtcp.conf.XXXXXX")"
-    CLEANUP_PATHS+=("$yaml_tmp" "$conf_tmp")
-    extract_embedded CN_YAML | awk -v business=":$business_port" \
+    CLEANUP_PATHS+=("$yaml_template" "$yaml_tmp" "$conf_tmp")
+    legacy_unit="$(read_config_value "$cn_dir/mtcp.conf" UNIT 2>/dev/null || true)"
+    if [[ -r "$instance_dir/cn.yaml" ]]; then
+        cp -p "$instance_dir/cn.yaml" "$yaml_template"
+    elif [[ "$legacy_unit" == "$main_unit" && -r "$cn_dir/cn.yaml" ]]; then
+        cp -p "$cn_dir/cn.yaml" "$yaml_template"
+        echo "检测到旧版平铺配置，正在迁移并保留现有 Relay。"
+    else
+        extract_embedded CN_YAML > "$yaml_template"
+    fi
+    awk -v business=":$business_port" \
         -v anchor="127.0.0.1:$anchor_port" -v remote="$remote_ip:$remote_port" '
         /^[[:space:]]*-[[:space:]]name:[[:space:]]*tcp-entry[[:space:]]*$/ { target="business" }
         /^[[:space:]]*-[[:space:]]name:[[:space:]]*mtcp-anchor[[:space:]]*$/ { target="anchor" }
@@ -426,14 +437,21 @@ install_cn() {
         }
         { print }
         END { if (a != 1 || b != 1 || r != 1) exit 42 }
-    ' > "$yaml_tmp" || die "canonical CN YAML 结构不符合预期"
+    ' "$yaml_template" > "$yaml_tmp" || die "CN YAML 结构不符合预期"
+
+    business_ports="$(cn_business_ports "$yaml_tmp")"
+    [[ " $business_ports " == *" $business_port "* ]] || \
+        die "迁移后的 CN YAML 未包含主业务端口 $business_port"
+    [[ " $business_ports " != *" $anchor_port "* ]] || \
+        die "迁移后的业务端口错误包含 Anchor 端口 $anchor_port"
 
     extract_embedded CN_MTCP_CONF | awk -v main="$main_unit" -v anchor_unit="$anchor_unit" \
         -v remote="$remote_ip" -v remote_port="$remote_port" -v business="$business_port" \
-        -v anchor_port="$anchor_port" -v rtt="$rtt_threshold" -v state="$state_dir" '
+        -v business_ports="$business_ports" -v anchor_port="$anchor_port" \
+        -v rtt="$rtt_threshold" -v state="$state_dir" '
         BEGIN {
             v["UNIT"]=main; v["ANCHOR_UNIT"]=anchor_unit; v["DST"]=remote; v["PORT"]=remote_port
-            v["BUSINESS_PORT"]=business; v["BUSINESS_PORTS"]=business; v["ANCHOR_HOST"]="127.0.0.1"
+            v["BUSINESS_PORT"]=business; v["BUSINESS_PORTS"]=business_ports; v["ANCHOR_HOST"]="127.0.0.1"
             v["ANCHOR_PORT"]=anchor_port; v["ACCEPT_RTT_MS"]=rtt; v["STATE_DIR"]=state
             v["STATE_FILE"]=state "/runtime.state"; v["STATUS_JSON"]=state "/status.json"
             v["EVENT_FILE"]=state "/events.jsonl"
