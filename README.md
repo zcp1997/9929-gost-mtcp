@@ -21,6 +21,38 @@
 
 已经实测覆盖三种故障场景并能自动恢复: Remote 整体不可达、outer 消失、TCP 还显示 `ESTAB` 但 MTCP 数据面其实已经失效。
 
+## ECMP 实测依据
+
+我们选择 GreenCloud 官方数据中心页面列出的 [Tokyo Datacenter (Softbank) NTT](https://greencloudvps.com/data-centers.php), 以测试 IPv4 `103.201.131.7` 的 TCP `22` 端口作为测试对象。测试脚本每次建立一条全新的 TCP flow, 等待 `0.15` 秒后从 Linux `TCP_INFO` 读取 `minrtt`, 随后主动关闭连接并继续下一次采样。执行命令:
+
+```bash
+./ecmp-test.sh 1000
+```
+
+在 1000 次连接尝试中得到 970 个有效样本, 实测结果如下:
+
+```text
+==============================
+ ECMP minRTT distribution
+==============================
+ 33 ms :   257   26.49%
+ 34 ms :   218   22.47%
+ 35 ms :     3    0.31%
+ 36 ms :     1    0.10%
+ 50 ms :   291   30.00%
+ 51 ms :   173   17.84%
+ 52 ms :    26    2.68%
+ 56 ms :     1    0.10%
+
+Average minrtt: 42.139 ms
+
+Valid samples: 970 / 1000
+```
+
+有效样本呈明显双峰: `33-36 ms` 共 479 个(49.38%), `50-56 ms` 共 491 个(50.62%), 平均 `minrtt` 为 `42.139 ms`。这说明同一目标、同一端口的新建 TCP flow 大致各有一半落入快路和慢路, 正是本项目通过 Prewarm 先选中快路, 再让业务复用唯一 MTCP outer 的现实依据。
+
+完整测试脚本见 [`ecmp-test.sh`](ecmp-test.sh)。
+
 ## 怎么工作的
 
 系统由四部分组成:
