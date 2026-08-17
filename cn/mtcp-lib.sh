@@ -14,6 +14,8 @@ CONFIG_KEYS=(
     ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC
     WATCH_INTERVAL_SEC ZERO_GRACE_SEC REMOTE_PROBE_INTERVAL_SEC
     REMOTE_PROBE_TIMEOUT_SEC REMOTE_PROBE_ATTEMPTS DOWN_RETRY_SEC
+    DATA_PROBE_ENABLED DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC
+    DATA_PROBE_FAIL_THRESHOLD
     STUCK_RESTART_AFTER_SEC RESTART_COOLDOWN_SEC MULTI_CONFIRM_COUNT
     STATE_DIR STATE_FILE STATUS_JSON EVENT_FILE RETENTION_SEC
 )
@@ -40,6 +42,22 @@ load_config() {
     STATUS_JSON="${STATUS_JSON:-${STATE_DIR}/status.json}"
     EVENT_FILE="${EVENT_FILE:-${STATE_DIR}/events.jsonl}"
     RETENTION_SEC="${RETENTION_SEC:-86400}"
+
+    DATA_PROBE_ENABLED="${DATA_PROBE_ENABLED:-yes}"
+    DATA_PROBE_INTERVAL_SEC="${DATA_PROBE_INTERVAL_SEC:-15}"
+    DATA_PROBE_TIMEOUT_SEC="${DATA_PROBE_TIMEOUT_SEC:-3}"
+    DATA_PROBE_FAIL_THRESHOLD="${DATA_PROBE_FAIL_THRESHOLD:-3}"
+    case "$DATA_PROBE_ENABLED" in
+      yes|no) ;;
+      *) echo "DATA_PROBE_ENABLED must be yes or no in config: $cfg" >&2; return 1 ;;
+    esac
+    local probe_key
+    for probe_key in DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC DATA_PROBE_FAIL_THRESHOLD; do
+        if [[ ! "${!probe_key}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "$probe_key must be a positive integer in config: $cfg" >&2
+            return 1
+        fi
+    done
     mkdir -p "$STATE_DIR"
 }
 
@@ -168,6 +186,22 @@ remote_tcp_reachable() {
     return 1
 }
 
+# 经本地 Anchor 入口建立一个新的 logical stream，并验证 payload 能沿当前
+# chain-mtcp -> outer -> Remote echo endpoint 完成一次双向传输。
+data_plane_probe() {
+    local host="${ANCHOR_HOST:-127.0.0.1}"
+    local port="${ANCHOR_PORT:-12001}"
+    local timeout_sec="${DATA_PROBE_TIMEOUT_SEC:-3}"
+
+    timeout "$timeout_sec" bash -c '
+        exec 3<>"/dev/tcp/${1}/${2}" || exit 1
+        printf "P" >&3 || exit 1
+        reply=""
+        IFS= read -r -n 1 reply <&3 || exit 1
+        [[ "$reply" == "P" ]]
+    ' _ "$host" "$port" >/dev/null 2>&1
+}
+
 kill_outer_sport() {
     local pid="$1" sport="$2" current count
     count="$(get_gost_outer_count "$pid")"; [[ "$count" == "1" ]] || return 1
@@ -189,14 +223,17 @@ wait_outer_gone() {
 write_status_json() {
     local state="${1:-UNKNOWN}" reason="${2:-}" pid="${3:-0}" sport="${4:-}"
     local minrtt="${5:-}" rtt="${6:-}" outer="${7:-0}" remote="${8:-unknown}"
+    local data_plane="${9:-unknown}" data_failures="${10:-0}"
     local apid acount business astate tmp epoch ts
+    [[ "$data_failures" =~ ^[0-9]+$ ]] || data_failures=0
     apid="$(get_anchor_pid)"; acount="$(get_anchor_conn_count "$apid")"
     business="$(get_business_conn_count "$pid")"
     if (( apid > 0 && acount == 1 )); then astate="up"; elif (( apid > 0 )); then astate="starting"; else astate="down"; fi
     epoch="$(now_epoch)"; ts="$(now_text)"; tmp="${STATUS_JSON}.tmp.$$"
-    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
+    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
       "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$UNIT")" \
       "$(json_escape "$DST")" "$PORT" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
-      "$(json_escape "$remote")" "$(json_escape "$ANCHOR_UNIT")" "$astate" "${apid:-0}" "${acount:-0}" "${business:-0}" > "$tmp"
+      "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
+      "${apid:-0}" "${acount:-0}" "${business:-0}" > "$tmp"
     mv -f "$tmp" "$STATUS_JSON"
 }

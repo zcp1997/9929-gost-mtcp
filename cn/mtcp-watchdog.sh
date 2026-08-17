@@ -31,12 +31,20 @@ fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
+reset_data_probe_state() {
+    LAST_DATA_PROBE=0
+    DATA_PROBE_FAILS=0
+    DATA_PLANE_OK="unknown"
+    DATA_PROBE_SPORT=""
+}
+
 reset_runtime_state() {
     SAVED_BOOT_ID=""
     STATE="INIT"; REASON=""; LAST_PID=0; LAST_NONZERO_PID=0; LAST_SPORT=""
     ZERO_SINCE=0; WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0
     LAST_REMOTE_PROBE=0; REMOTE_OK="unknown"; LAST_RESTART=0; MULTI_SEEN=0
     LAST_DEGRADED_RETRY=0; LAST_RECOVERY_ATTEMPT=0; LAST_ANCHOR_RETRY=0; LAST_PRUNE=0
+    reset_data_probe_state
     HAVE_RUNTIME=0
 }
 
@@ -58,6 +66,15 @@ load_runtime_state() {
     if [[ "${SAVED_BOOT_ID:-}" != "$BOOT_ID" ]]; then
         reset_runtime_state
         return 1
+    fi
+    : "${LAST_DATA_PROBE:=0}"
+    : "${DATA_PROBE_FAILS:=0}"
+    : "${DATA_PLANE_OK:=unknown}"
+    : "${DATA_PROBE_SPORT:=}"
+    if [[ ! "$LAST_DATA_PROBE" =~ ^[0-9]+$ || ! "$DATA_PROBE_FAILS" =~ ^[0-9]+$ ]] ||
+       [[ "$DATA_PLANE_OK" != "yes" && "$DATA_PLANE_OK" != "no" && "$DATA_PLANE_OK" != "unknown" ]] ||
+       [[ -n "$DATA_PROBE_SPORT" && ! "$DATA_PROBE_SPORT" =~ ^[0-9]+$ ]]; then
+        reset_data_probe_state
     fi
     HAVE_RUNTIME=1
     return 0
@@ -84,6 +101,10 @@ LAST_DEGRADED_RETRY='$LAST_DEGRADED_RETRY'
 LAST_RECOVERY_ATTEMPT='$LAST_RECOVERY_ATTEMPT'
 LAST_ANCHOR_RETRY='$LAST_ANCHOR_RETRY'
 LAST_PRUNE='$LAST_PRUNE'
+LAST_DATA_PROBE='$LAST_DATA_PROBE'
+DATA_PROBE_FAILS='$DATA_PROBE_FAILS'
+DATA_PLANE_OK='$DATA_PLANE_OK'
+DATA_PROBE_SPORT='$DATA_PROBE_SPORT'
 STATEEOF
     mv -f "$tmp" "$STATE_FILE"
 }
@@ -96,7 +117,8 @@ set_state() {
     else
         STATE="$new_state"; REASON="$new_reason"
     fi
-    write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" "$outer" "$REMOTE_OK"
+    write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" "$outer" "$REMOTE_OK" \
+        "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
 }
 
 restart_gost_rate_limited() {
@@ -109,15 +131,20 @@ restart_gost_rate_limited() {
     LAST_RESTART="$now"
     stop_anchor
     log_event "FAULT" "RESTART_GOST" "$reason" "$LAST_PID" "$LAST_SPORT"
-    systemctl restart "$UNIT" || true
+    if ! systemctl restart "$UNIT"; then
+        log_event "FAULT" "RESTART_GOST_FAILED" "$reason" "$LAST_PID" "$LAST_SPORT"
+        return 2
+    fi
     (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
     LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
+    reset_data_probe_state
     return 0
 }
 
 # v1 的 prewarm 已经负责：建立候选 Anchor -> 测 minrtt -> 慢路重抽 -> 成功后直接留下 Anchor。
 run_select() {
     local mode="${1:-normal}" cause="${2:-SELECT}" rc pid count sport info minrtt rtt
+    reset_data_probe_state
     MTCP_PREWARM_MODE="$mode" "$PREWARM" "$CONFIG"; rc=$?
 
     case "$rc" in
@@ -138,7 +165,8 @@ run_select() {
             STATE="DEGRADED"; REASON="PATH"; LAST_DEGRADED_RETRY="$(now_epoch)"
             log_event "DEGRADED" "ANCHOR_BOUND_SLOW" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "cause=$cause"
         fi
-        write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" 1 "$REMOTE_OK"
+        write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" 1 "$REMOTE_OK" \
+            "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
         return "$rc"
         ;;
       11)
@@ -146,7 +174,8 @@ run_select() {
         sport="$(get_single_sport "$pid" 2>/dev/null || true)"
         info="$(get_tcp_info "$sport")"; minrtt="${info%%|*}"; rtt="${info#*|}"
         STATE="DEGRADED"; REASON="ANCHOR"; LAST_PID="$pid"; LAST_SPORT="$sport"; LAST_ANCHOR_RETRY="$(now_epoch)"
-        write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" "$count" "$REMOTE_OK"
+        write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" "$count" "$REMOTE_OK" \
+            "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
         return 11
         ;;
       20)
@@ -176,8 +205,10 @@ adopt_current() {
         return 2
     fi
     LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT="$sport"; ZERO_SINCE=0; REMOTE_OK="yes"; STATE="FAST"; REASON="PATH"
+    reset_data_probe_state
     log_event "FAST" "ADOPT_EXISTING_FAST" "PATH" "$pid" "$sport" "$minrtt" "$rtt"
-    write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" 1 "$REMOTE_OK"
+    write_status_json "$STATE" "$REASON" "$pid" "$sport" "$minrtt" "$rtt" 1 "$REMOTE_OK" \
+        "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
     save_runtime_state
 }
 
@@ -198,6 +229,8 @@ while true; do
         stop_anchor
         (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
         LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0
+        reset_data_probe_state
+        DATA_PLANE_OK="no"
         set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -206,6 +239,7 @@ while true; do
     if (( HAVE_RUNTIME == 0 )); then
         log_event "DOWN" "WATCHDOG_COLD_START" "INIT" "$pid"
         LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0; REMOTE_OK="unknown"
+        reset_data_probe_state
         if remote_tcp_reachable; then
             REMOTE_OK="yes"; run_select normal "COLD_START" || true
         else
@@ -221,6 +255,7 @@ while true; do
         (( old_pid > 0 )) || old_pid="$LAST_PID"
         stop_anchor
         LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
+        reset_data_probe_state
         log_event "DOWN" "GOST_PID_CHANGED" "PROCESS" "$pid" "" "" "" "old_pid=$old_pid"
         if remote_tcp_reachable; then
             REMOTE_OK="yes"; run_select normal "GOST_PID_CHANGED" || true
@@ -233,6 +268,8 @@ while true; do
     count="$(get_gost_outer_count "$pid")"
 
     if (( count > 1 )); then
+        reset_data_probe_state
+        DATA_PLANE_OK="no"
         ((MULTI_SEEN++)); set_state "FAULT" "MULTI_OUTER" "$pid" "" "" "" "$count"
         if (( MULTI_SEEN >= ${MULTI_CONFIRM_COUNT:-2} )); then restart_gost_rate_limited "MULTI_OUTER" || true; fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
@@ -242,6 +279,8 @@ while true; do
 
     if (( count == 0 )); then
         WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0; LAST_SPORT=""
+        reset_data_probe_state
+        DATA_PLANE_OK="no"
         stop_anchor
         if (( ZERO_SINCE == 0 )); then
             ZERO_SINCE="$now"
@@ -290,8 +329,8 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
-    # outer == 1
-    ZERO_SINCE=0; LAST_RECOVERY_ATTEMPT=0; REMOTE_OK="yes"
+    # outer == 1。ESTAB 只证明 socket 仍存在，不能据此推断 Remote 或 MTCP 数据面健康。
+    ZERO_SINCE=0; LAST_RECOVERY_ATTEMPT=0
     sport="$(get_single_sport "$pid" 2>/dev/null || true)"
     [[ -n "$sport" ]] || { save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue; }
     info="$(get_tcp_info "$sport")"; minrtt="${info%%|*}"; rtt="${info#*|}"
@@ -299,6 +338,7 @@ while true; do
 
     if [[ -z "$LAST_SPORT" ]]; then
         LAST_SPORT="$sport"
+        reset_data_probe_state
         run_select normal "INITIAL_NO_SPORT" || true
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -307,6 +347,7 @@ while true; do
         old_sport="$LAST_SPORT"
         log_event "DOWN" "SESSION_CHANGED" "NEW_SPORT" "$pid" "$sport" "$minrtt" "$rtt" "old=$old_sport business=$business"
         LAST_SPORT="$sport"
+        reset_data_probe_state
         run_select recovery "SESSION_CHANGED" || true
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -320,6 +361,7 @@ while true; do
                 after_sport="$(get_single_sport "$pid" 2>/dev/null || true)"
                 if (( after_count == 1 )) && [[ "$after_sport" == "$before_sport" ]]; then
                     LAST_ANCHOR_RETRY=0
+                    reset_data_probe_state
                     log_event "$STATE" "ANCHOR_RESTORED" "ANCHOR" "$pid" "$sport" "$minrtt" "$rtt"
                 else
                     stop_anchor
@@ -334,6 +376,123 @@ while true; do
             fi
         else
             set_state "DEGRADED" "ANCHOR" "$pid" "$sport" "$minrtt" "$rtt" 1
+            save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+        fi
+    fi
+
+    # Data Plane Probe：outer=1 只能说明内核仍保留 ESTAB socket；只有通过
+    # Anchor echo 回路收发 payload，才能证明当前 MTCP mux/outer 仍可用。
+    if [[ "$DATA_PROBE_ENABLED" == "no" ]]; then
+        if (( LAST_DATA_PROBE != 0 || DATA_PROBE_FAILS != 0 )) || \
+           [[ "$DATA_PLANE_OK" != "unknown" || -n "$DATA_PROBE_SPORT" ]]; then
+            reset_data_probe_state
+        fi
+        # 显式关闭新探测时保持旧版 outer=1 的兼容语义。
+        REMOTE_OK="yes"
+    else
+        probe_threshold="$DATA_PROBE_FAIL_THRESHOLD"
+
+        # 连续失败只对同一条 outer session 有效。
+        if [[ -n "$DATA_PROBE_SPORT" && "$DATA_PROBE_SPORT" != "$sport" ]]; then
+            reset_data_probe_state
+        fi
+
+        # 已确认整条 CN -> Remote 网络不可达时，只按 Remote 探测节奏等待；
+        # Remote 恢复后再做一次 Data Probe，避免断网期间堆积超时 logical stream。
+        if [[ "$DATA_PLANE_OK" == "no" && "$REMOTE_OK" == "no" ]] && \
+           (( DATA_PROBE_FAILS >= probe_threshold )); then
+            if (( LAST_REMOTE_PROBE == 0 || now - LAST_REMOTE_PROBE >= ${REMOTE_PROBE_INTERVAL_SEC:-15} )); then
+                LAST_REMOTE_PROBE="$now"
+                if remote_tcp_reachable; then
+                    REMOTE_OK="yes"
+                    log_event "DOWN" "REMOTE_TCP_UP" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" \
+                        "data_probe_failures=$DATA_PROBE_FAILS"
+
+                    LAST_DATA_PROBE="$now"
+                    DATA_PROBE_SPORT="$sport"
+                    if data_plane_probe; then
+                        previous_failures="$DATA_PROBE_FAILS"
+                        DATA_PROBE_FAILS=0
+                        DATA_PLANE_OK="yes"
+                        log_event "$STATE" "DATA_PROBE_RECOVERED" "DATA_PLANE" \
+                            "$pid" "$sport" "$minrtt" "$rtt" "previous_failures=$previous_failures"
+                    else
+                        log_event "FAULT" "DATA_PROBE_FAILED" "DATA_PLANE" \
+                            "$pid" "$sport" "$minrtt" "$rtt" \
+                            "fail=$DATA_PROBE_FAILS/$probe_threshold after_remote_recovery=yes"
+                        set_state "FAULT" "STALE_OUTER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                        log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
+                            "$pid" "$sport" "$minrtt" "$rtt" \
+                            "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
+                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                        save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                    fi
+                fi
+            fi
+
+            if [[ "$REMOTE_OK" == "no" ]]; then
+                set_state "DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" 1
+                save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+            fi
+        fi
+
+        if (( LAST_DATA_PROBE == 0 || now - LAST_DATA_PROBE >= DATA_PROBE_INTERVAL_SEC )); then
+            LAST_DATA_PROBE="$now"
+            DATA_PROBE_SPORT="$sport"
+
+            if data_plane_probe; then
+                if (( DATA_PROBE_FAILS > 0 )) || [[ "$DATA_PLANE_OK" == "no" ]]; then
+                    log_event "$STATE" "DATA_PROBE_RECOVERED" "DATA_PLANE" \
+                        "$pid" "$sport" "$minrtt" "$rtt" "previous_failures=$DATA_PROBE_FAILS"
+                fi
+                DATA_PROBE_FAILS=0
+                DATA_PLANE_OK="yes"
+                REMOTE_OK="yes"
+            else
+                DATA_PLANE_OK="no"
+                if (( DATA_PROBE_FAILS < probe_threshold )); then
+                    DATA_PROBE_FAILS=$((DATA_PROBE_FAILS + 1))
+                fi
+                log_event "DEGRADED" "DATA_PROBE_FAILED" "DATA_PLANE" \
+                    "$pid" "$sport" "$minrtt" "$rtt" \
+                    "fail=$DATA_PROBE_FAILS/$probe_threshold"
+
+                if (( DATA_PROBE_FAILS < probe_threshold )); then
+                    set_state "DEGRADED" "DATA_PLANE" "$pid" "$sport" "$minrtt" "$rtt" 1
+                    save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                fi
+
+                LAST_REMOTE_PROBE="$now"
+                old_remote="$REMOTE_OK"
+                if remote_tcp_reachable; then
+                    REMOTE_OK="yes"
+                    [[ "$old_remote" == "yes" ]] || \
+                        log_event "DOWN" "REMOTE_TCP_UP" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt"
+                    set_state "FAULT" "STALE_OUTER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                    log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
+                        "$pid" "$sport" "$minrtt" "$rtt" \
+                        "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
+                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                else
+                    REMOTE_OK="no"
+                    [[ "$old_remote" == "no" ]] || \
+                        log_event "DOWN" "REMOTE_TCP_DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" \
+                            "data_probe_failures=$DATA_PROBE_FAILS"
+                    set_state "DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" 1
+                fi
+                save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+            fi
+        fi
+
+        # 探测失败状态优先于 PATH/LIVE_RTT，避免下方状态机误覆盖为 FAST。
+        if [[ "$DATA_PLANE_OK" == "no" ]]; then
+            if [[ "$REMOTE_OK" == "no" ]]; then
+                set_state "DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" 1
+            elif (( DATA_PROBE_FAILS >= probe_threshold )); then
+                set_state "FAULT" "STALE_OUTER" "$pid" "$sport" "$minrtt" "$rtt" 1
+            else
+                set_state "DEGRADED" "DATA_PLANE" "$pid" "$sport" "$minrtt" "$rtt" 1
+            fi
             save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
         fi
     fi

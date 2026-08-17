@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standal
 # 2. 记录 Remote 的公网 IPv4 和 MTCP 端口（默认 6600）
 
 # 3. 再安装 CN（中国大陆服务器）
-curl -fsSL https://raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s cn
+curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/9929-gost-mtcp/main/standalone-install.sh | bash -s cn
 # 按提示输入 Remote IP、端口和 RTT 阈值（默认 40ms）
 ```
 
@@ -103,11 +103,11 @@ systemctl status gost-mtcp-remote.service
 ss -lntp | grep ':6600'
 ```
 
-### CN（假设线路别名为 de）
+### CN（假设线路别名为 jp）
 
 ```bash
-systemctl status gost-mtcp-de.service
-systemctl status gost-mtcp-de-watchdog.service
+systemctl status gost-mtcp-jp.service
+systemctl status gost-mtcp-jp-watchdog.service
 
 # 查看状态
 cat /opt/gost-mtcp/cn/state/status.json
@@ -123,6 +123,8 @@ ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 - `state: FAST` - 路径满足阈值
 - `outer_count: 1` - 唯一 outer TCP
 - `minrtt_ms < 40` - 快路
+- `data_plane_reachable: yes` - 当前 MTCP 数据面能完成真实 payload 往返
+- `data_probe_failures: 0` - 连续数据面探测失败次数
 - `anchor_state: up` - Anchor 正常
 
 ## 常见配置
@@ -145,7 +147,7 @@ forwarder:
     addr: 127.0.0.1:8080  # 改为实际地址
 
 # 重启服务
-systemctl restart gost-mtcp-de.service
+systemctl restart gost-mtcp-jp.service
 ```
 
 ### 修改 RTT 阈值
@@ -157,8 +159,25 @@ nano /opt/gost-mtcp/cn/mtcp.conf
 ACCEPT_RTT_MS=35
 
 # 重启 Watchdog
-systemctl restart gost-mtcp-de-watchdog.service
+systemctl restart gost-mtcp-jp-watchdog.service
 ```
+
+### 数据面探测与 stale outer 恢复
+
+Watchdog 默认每 15 秒经本地 Anchor 入口发送并收回 1 Byte。连续失败 3 次后，
+如果 Remote MTCP 端口已经恢复但当前数据面仍不通，会将其判定为 stale outer，
+限频重启 GOST，并由现有 Prewarm 自动重新选路。
+
+```bash
+# mtcp.conf 默认值
+DATA_PROBE_ENABLED=yes
+DATA_PROBE_INTERVAL_SEC=15
+DATA_PROBE_TIMEOUT_SEC=3
+DATA_PROBE_FAIL_THRESHOLD=3
+```
+
+整个 CN → Remote 网络仍不可达时只会进入 `DOWN/REMOTE` 并定期探测 Remote，
+不会循环重启 GOST。将 `DATA_PROBE_ENABLED` 改为 `no` 可以恢复旧版行为。
 
 ### 多线路部署
 
@@ -167,12 +186,49 @@ systemctl restart gost-mtcp-de-watchdog.service
 ```bash
 # 第一条线路
 bash standalone-install.sh cn
-# 别名: de, 业务端口: 12000, Anchor: 12001
+# 别名: jp, 业务端口: 12000, Anchor: 12001
 
 # 第二条线路
 bash standalone-install.sh cn
 # 别名: us, 业务端口: 12002, Anchor: 12003
 ```
+
+### 管理 CN 额外端口 Relay
+
+standalone 安装器可以在不手工编辑 YAML 的情况下列出、增加和删除额外业务入口。
+新增 Relay 会和主业务入口共用现有 `chain-mtcp` 及唯一 MTCP outer。
+
+```bash
+# 交互管理
+bash standalone-install.sh relay
+
+# 分项命令
+bash standalone-install.sh relay list
+bash standalone-install.sh relay add
+bash standalone-install.sh relay remove relay-12002
+```
+
+例如执行 `relay add` 后输入：
+
+```text
+新增 CN 监听端口: 12002
+Remote 后端地址: 127.0.0.1:2347
+Relay 服务名: relay-12002
+```
+
+会生成 `:12002 → chain-mtcp → 127.0.0.1:2347`。修改前会备份 `cn.yaml`；
+脚本随后重启对应 GOST unit，如果服务未恢复 active 会自动回滚。主业务端口和
+Anchor 端口不能通过 Relay 管理器删除或覆盖。
+
+如安装目录不是默认的 `/opt/gost-mtcp`，管理时传入相同环境变量：
+
+```bash
+INSTALL_BASE=/root/mtcpjpv22 bash standalone-install.sh relay
+```
+
+管理器会自动识别 `$INSTALL_BASE/cn/cn.yaml` 和类似你当前
+`$INSTALL_BASE/cn.yaml` 的平铺布局；也可以用 `CN_YAML_PATH`、
+`CN_MTCP_CONFIG_PATH` 显式指定两个配置文件。
 
 ## 重要注意事项
 
@@ -191,11 +247,11 @@ Anchor 必须由 Prewarm/Watchdog 控制，不要手动启动或 enable：
 
 ```bash
 # ❌ 错误
-systemctl enable gost-mtcp-de-anchor.service
+systemctl enable gost-mtcp-jp-anchor.service
 
 # ✓ 正确（安装器已自动配置）
-systemctl enable gost-mtcp-de.service
-systemctl enable gost-mtcp-de-watchdog.service
+systemctl enable gost-mtcp-jp.service
+systemctl enable gost-mtcp-jp-watchdog.service
 ```
 
 ⚠️ **hard failure 无法无缝续传**
@@ -214,16 +270,16 @@ systemctl enable gost-mtcp-de-watchdog.service
 | 状态 | 含义 |
 |------|------|
 | `FAST` | 唯一 outer、Anchor 正常、路径满足阈值 |
-| `DEGRADED` | 连接可用但未达最佳（路径慢、Anchor 异常等） |
+| `DEGRADED` | 连接可用但未达最佳（路径慢、Anchor 异常、数据面探测暂时失败等） |
 | `DOWN` | GOST/outer/Remote 不可用 |
-| `FAULT` | outer 数量异常或优选过程故障 |
+| `FAULT` | outer 数量异常、stale outer 或优选过程故障 |
 
 ## 故障排查
 
 ```bash
 # 查看服务日志
-journalctl -u gost-mtcp-de.service -n 100
-journalctl -u gost-mtcp-de-watchdog.service -n 100
+journalctl -u gost-mtcp-jp.service -n 100
+journalctl -u gost-mtcp-jp-watchdog.service -n 100
 
 # 查看状态
 cat /opt/gost-mtcp/cn/state/status.json | jq
@@ -233,6 +289,14 @@ tail -n 50 /opt/gost-mtcp/cn/state/events.jsonl
 
 # 检查 Remote 连通性
 timeout 2 bash -c "exec 3<>/dev/tcp/<REMOTE_IP>/6600" && echo "OK" || echo "FAIL"
+
+# 检查当前 MTCP 数据面（替换实际 Anchor 端口）
+timeout 3 bash -c '
+exec 3<>/dev/tcp/127.0.0.1/12001 || exit 1
+printf P >&3
+IFS= read -r -n 1 reply <&3 || exit 1
+[[ "$reply" == P ]]
+' && echo "MTCP DATA OK" || echo "MTCP DATA FAIL"
 ```
 
 ## 工作原理
@@ -241,7 +305,7 @@ v2.2 采用 **Prewarm + Anchor + Watchdog** 三层架构：
 
 - **Prewarm** - 启动时建立候选 outer，读取 TCP `minrtt`，慢路淘汰并重抽直到抽中快路
 - **Anchor** - 在选中路径上保持轻量 logical stream，避免空闲时 outer 消失
-- **Watchdog** - 监控 GOST PID、outer 数量、Anchor 和 Remote 可达性，明确故障后自动重新优选
+- **Watchdog** - 监控 GOST PID、outer 数量、Anchor、Remote 可达性和实际数据面，明确故障后自动重新优选
 
 设计原则：
 - 新 outer 用 `minrtt` 判断基础路径
