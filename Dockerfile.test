@@ -1,0 +1,15 @@
+FROM debian:12-slim
+
+# 安装所有依赖
+RUN apt-get update && apt-get install -y \
+    bash curl tar coreutils grep gawk systemd \
+    iproute2 util-linux socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制安装器
+COPY standalone-install.sh /tmp/standalone-install.sh
+
+# 设置工作目录
+WORKDIR /root
+
+CMD ["/bin/bash"]
