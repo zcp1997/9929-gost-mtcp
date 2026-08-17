@@ -6,25 +6,39 @@
 ## 架构
 
 ```text
-+------------------+    TCP    +------------------------+   MTCP outer   +----------------------+    TCP    +------------------+
-| Business clients | --------> | CN GOST                | =============> | Remote GOST :6600    | --------> | Backend service  |
-|                  |           | :12000 + extra relays  |                | MTCP relay           |           | 127.0.0.1:2345   |
-+------------------+           +-----------+------------+                +----------------------+           +------------------+
-                                           ^
-                                           | manages / probes
-                               +-----------+------------+
-                               | CN recovery control    |
-                               | Prewarm : select path  |
-                               | Anchor  : hold stream  |
-                               | Watchdog + Data Probe  |
-                               +------------------------+
++----------------+           +------------------------------------+    selected MTCP outer    +--------------------------------+
+| Business       |    TCP    | CN GOST                            | ========================> | Remote GOST                    |
+| clients        | --------> | business :12000 + relays           |                           | MTCP listener :6600            |
+|                |           | anchor/probe 127.0.0.1:12001       |                           | per-stream TCP relay           |
+|                |           | shared chain-mtcp / connector      |                           |                                |
++----------------+           +------------------+-----------------+                           +----------------+---------------+
+                                                ^                                                              |
+                                                | manages / observes                                           v
+                             +------------------------------------+                           +--------------------------------+
+                             | CN recovery control                |                           | requested stream targets       |
+                             | Prewarm : draw ECMP by minrtt      |                           | business :2345/:2347/...       |
+                             | Anchor  : hold logical stream      |                           | probe echo :12346              |
+                             | Watchdog: PID/outer/RTT/Remote     |
+                             | Probe   : 1-byte payload echo      |
+                             +------------------------------------+
 ```
 
-- 所有业务入口共用 `chain-mtcp` 和唯一一条经过优选的 MTCP outer TCP。
-- **Prewarm** 建立候选 outer，读取 TCP `minrtt`，淘汰慢路并重新抽取 ECMP 路径。
-- **Anchor** 保持轻量 logical stream，避免选中的 outer 因空闲被释放。
-- **Watchdog** 监控进程、outer、Anchor、Remote TCP 和 MTCP 数据面，并负责自动恢复。
-- **Data Plane Probe** 通过 Anchor echo 实际发送 payload，识别“TCP ESTAB 但 MTCP 数据面已死”的 stale outer。
+跨境链路存在 ECMP，不同新建 TCP 可能落到约 32-34 ms 的快路，也可能落到约
+50-52 ms 的慢路。系统通过以下组件把业务稳定复用到一条选中的 outer：
+
+- **业务入口**：`:12000` 及 Relay 管理器增加的端口都使用 `chain-mtcp`，共享同一个
+  MTCP connector 和唯一 outer；每个 logical stream 携带各自的 Remote backend 目标。
+- **Prewarm**：由 Anchor 建立候选 outer，读取 TCP `minrtt`；达到阈值则保留，慢路则
+  停止 Anchor、移除当前 outer，并重新抽取下一条 ECMP session；抽取额度耗尽时保留
+  最后一条可用路径，优先保证业务可连接。
+- **Anchor**：持续占用一个轻量 logical stream，锁定选中的 outer；本机入口是
+  `127.0.0.1:12001`，Remote 目标是 echo endpoint `127.0.0.1:12346`。
+- **Watchdog**：监控 GOST PID、outer 数量、TCP RTT、Anchor、Remote TCP 和实际数据面，
+  写入状态/事件文件，并对 Remote 真断、outer 消失及 stale outer 分别进入恢复路径。
+- **Data Plane Probe**：同样经过 `12001 -> chain-mtcp -> selected outer -> 12346`，每
+  15 秒默认执行一次 1 Byte payload echo，识别“TCP 仍为 `ESTAB`、但 MTCP 数据面已死”。
+- **Remote Relay**：在 `:6600` 接收共享 outer 内的 logical streams，再按 stream 目标
+  转发到 `127.0.0.1:2345`、`:2347` 等业务后端或 `127.0.0.1:12346` 探测 endpoint。
 
 ## 快速安装
 
