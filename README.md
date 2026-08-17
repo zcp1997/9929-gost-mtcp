@@ -27,7 +27,7 @@
 
 ## ECMP 实测依据
 
-我们选择 GreenCloud 官方数据中心页面列出的 [Tokyo Datacenter (Softbank) NTT](https://greencloudvps.com/data-centers.php), 以测试 IPv4 `103.201.131.7` 的 TCP `22` 端口作为测试对象。测试脚本每次建立一条全新的 TCP flow, 等待 `0.15` 秒后从 Linux `TCP_INFO` 读取 `minrtt`, 随后主动关闭连接并继续下一次采样。执行命令:
+我们选择 GreenCloud 官方数据中心页面列出的 [Tokyo Datacenter (Softbank) NTT](https://greencloudvps.com/data-centers.php), 以测试 IPv4 `103.201.131.7` 的 TCP `22` 端口作为测试对象。测试脚本每次建立一条全新的 TCP flow, 通过当前 FD 的 socket inode 找到它实际使用的源端点和目的端点, 等待 `0.15` 秒后再按完整 TCP 四元组从 Linux `TCP_INFO` 读取该 flow 的 `minrtt`, 随后主动关闭连接并继续下一次采样。这样即使机器上同时存在其他到相同目标端口的连接, 也不会串读它们的测量结果。执行命令:
 
 ```bash
 ./ecmp-test.sh 1000

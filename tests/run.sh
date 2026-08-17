@@ -8,8 +8,55 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
 
 bash -n install.sh standalone-install.sh scripts/generate-standalone.sh \
-    cn/mtcp-lib.sh cn/mtcp-prewarm.sh cn/mtcp-watchdog.sh
+    ecmp-test.sh cn/mtcp-lib.sh cn/mtcp-prewarm.sh cn/mtcp-watchdog.sh
 pass "all shell files parse"
+
+(
+    ecmp_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/ecmp-test.XXXXXX")"
+    trap 'rm -rf "$ecmp_test_dir"' EXIT
+    cat > "$ecmp_test_dir/ss" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SS_CALL_LOG"
+case "$*" in
+  "-Hntie state established")
+    cat <<'SS'
+0 0 192.0.2.10:40000 103.201.131.7:22 uid:0 ino:111 sk:1
+ cubic rtt:99/1 minrtt:99
+0 0 192.0.2.10:41000 103.201.131.7:22 uid:0 ino:222 sk:2
+ bbr rtt:33.5/1 minrtt:33.319
+ESTAB 0 0 192.0.2.10:42000 103.201.131.7:22 uid:0 ino:333 sk:3
+ bbr rtt:34/1 minrtt:34
+SS
+    ;;
+  *"src 192.0.2.10 sport = :41000 dst 103.201.131.7 dport = :22"*)
+    cat <<'SS'
+ESTAB 0 0 192.0.2.10:41000 103.201.131.7:22 ino:222
+ bbr rtt:33.5/1 minrtt:33.319
+SS
+    ;;
+  *) exit 1 ;;
+esac
+MOCK
+    chmod +x "$ecmp_test_dir/ss"
+    export SS_CALL_LOG="$ecmp_test_dir/ss-calls.log"
+    SS_BIN="$ecmp_test_dir/ss"
+    # shellcheck disable=SC1091
+    source ecmp-test.sh
+
+    [[ "$(socket_inode_from_link 'socket:[222]')" == 222 ]] || fail "socket inode parsing failed"
+    if socket_inode_from_link 'pipe:[222]' >/dev/null; then fail "non-socket FD was accepted"; fi
+    endpoints="$(get_socket_endpoints 222)"
+    [[ "$endpoints" == "192.0.2.10:41000 103.201.131.7:22" ]] || \
+        fail "ECMP test misparsed state-filtered ss output: $endpoints"
+    [[ "$(get_socket_endpoints 333)" == "192.0.2.10:42000 103.201.131.7:22" ]] || \
+        fail "ECMP test misparsed regular ss output"
+    [[ "$(get_minrtt_for_flow 192.0.2.10:41000 103.201.131.7:22)" == 33.319 ]] || \
+        fail "ECMP test read minrtt from the wrong flow"
+    grep -Fq 'src 192.0.2.10 sport = :41000 dst 103.201.131.7 dport = :22' "$SS_CALL_LOG" || \
+        fail "ECMP test did not query the complete TCP four-tuple"
+)
+! grep -q 'grep -m1.*minrtt\|10\\\.[0-9]' ecmp-test.sh || fail "unsafe ECMP lookup remains"
+pass "ECMP sampler binds TCP_INFO reads to the current FD and four-tuple"
 
 scripts/generate-standalone.sh --check >/dev/null
 pass "standalone embedded payload matches canonical files"
