@@ -5,22 +5,38 @@ set -euo pipefail
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s remote
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s cn
-#   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s relay
 #
-# 或下载后执行：
+# 或下载后执行（也可用于 Relay 管理）：
 #   wget https://raw.githubusercontent.com/.../standalone-install.sh
 #   bash standalone-install.sh remote
 #   bash standalone-install.sh cn
+#   bash standalone-install.sh relay
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 INSTALL_BASE="${INSTALL_BASE:-/opt/gost-mtcp}"
 GOST_VERSION="${GOST_VERSION:-v3.2.6}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+EMBEDDED_SOURCE=""
+PROMPT_FD=0
+PROMPT_FD_READY=0
+declare -a CLEANUP_PATHS=()
+
+cleanup() {
+    local status=$? path
+    for path in "${CLEANUP_PATHS[@]:-}"; do
+        if [[ -n "$path" && ( -f "$path" || -d "$path" ) ]]; then
+            rm -rf -- "$path" || true
+        fi
+    done
+    return "$status"
+}
+
+trap cleanup EXIT
 
 show_banner() {
     cat <<'BANNER'
 ============================================================
-  9929-gost-mtcp 自包含安装器 v1.1.0
+  9929-gost-mtcp 自包含安装器 v1.1.1
 
   基于 GOST MTCP 的 ECMP 低延迟路径优选方案
 ============================================================
@@ -60,7 +76,7 @@ show_usage() {
   # 增加 :12002 -> 127.0.0.1:2347 Relay
   bash standalone-install.sh relay add
 
-  # 管道安装
+  # 单命令安装（交互输入会直接读取当前终端）
   curl -fsSL https://example.com/install.sh | bash -s cn
 USAGE
 }
@@ -79,10 +95,49 @@ check_command() {
     command -v "$cmd" &>/dev/null || die "缺少命令: $cmd"
 }
 
+# bash 从管道或 process substitution 读取脚本时，$0 不是可重复读取的普通文件。
+# main 执行时脚本尾部尚未被解释，先保存嵌入区，供后续多次提取。
+prepare_embedded_source() {
+    local script_source="${BASH_SOURCE[0]:-}" tmp_source
+
+    if [[ -n "$script_source" && -f "$script_source" ]]; then
+        EMBEDDED_SOURCE="$script_source"
+        return
+    fi
+
+    tmp_source="$(mktemp)"
+    CLEANUP_PATHS+=("$tmp_source")
+    if [[ -n "$script_source" && -r "$script_source" ]]; then
+        sed -n '/^### BEGIN /,$p' "$script_source" > "$tmp_source"
+    else
+        sed -n '/^### BEGIN /,$p' <&0 > "$tmp_source"
+    fi
+    grep -q '^### BEGIN REMOTE_YAML ###$' "$tmp_source" || \
+        die "无法读取安装器内嵌文件；请重新下载安装脚本"
+    EMBEDDED_SOURCE="$tmp_source"
+}
+
+prepare_prompt_input() {
+    (( PROMPT_FD_READY == 0 )) || return 0
+    if [[ -r /dev/tty && -w /dev/tty ]] && exec 9<>/dev/tty; then
+        PROMPT_FD=9
+    else
+        PROMPT_FD=0
+    fi
+    PROMPT_FD_READY=1
+}
+
+prompt_read() {
+    local output_var="$1" prompt="$2" value
+    prepare_prompt_input
+    IFS= read -r -u "$PROMPT_FD" -p "$prompt" value || return 1
+    printf -v "$output_var" '%s' "$value"
+}
+
 # 从脚本末尾提取嵌入的文件
 extract_embedded() {
     local marker="$1"
-    sed -n "/^### BEGIN ${marker} ###$/,/^### END ${marker} ###$/p" "$0" | sed '1d;$d'
+    sed -n "/^### BEGIN ${marker} ###$/,/^### END ${marker} ###$/p" "$EMBEDDED_SOURCE" | sed '1d;$d'
 }
 
 normalize_role() {
@@ -109,34 +164,49 @@ MENU
 
     local choice
     while :; do
-        read -r -p "请选择 [1/2/3/q]: " choice || die "未选择角色"
+        prompt_read choice "请选择 [1/2/3/q]: " || die "未选择角色"
         case "$choice" in
             q|Q|quit|exit) echo "已取消。"; exit 0 ;;
             1|2|3)
                 SELECTED_ROLE=$(normalize_role "$choice")
                 [[ "$SELECTED_ROLE" == "relay" ]] && return
-                read -r -p "确认安装 $SELECTED_ROLE 端？[Y/n]: " confirm
+                prompt_read confirm "确认安装 $SELECTED_ROLE 端？[Y/n]: " || die "未确认安装"
                 case "${confirm:-y}" in
                     y|Y|yes|YES|"") return ;;
                     *) continue ;;
                 esac
                 ;;
+            "") ;;
             *) echo "无效输入" >&2 ;;
         esac
     done
+}
+
+download_release_file() {
+    local direct_url="$1" output="$2" proxy_url
+
+    if [[ -n "$GITHUB_PROXY_PREFIX" ]]; then
+        proxy_url="${GITHUB_PROXY_PREFIX%/}/${direct_url}"
+        if curl -fsSL --retry 2 --connect-timeout 10 -o "$output" "$proxy_url"; then
+            return 0
+        fi
+        echo "镜像下载失败，尝试直连 GitHub ..." >&2
+    fi
+
+    curl -fsSL --retry 2 --connect-timeout 10 -o "$output" "$direct_url"
 }
 
 download_gost() {
     local role="$1" dest_dir="$2"
 
     # CN 默认使用镜像，Remote 默认直连
-    if [[ "$role" == "cn" ]]; then
-        GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://ghfast.top/}"
+    if [[ "$role" == "cn" && -z "${GITHUB_PROXY_PREFIX+x}" ]]; then
+        GITHUB_PROXY_PREFIX="https://ghfast.top/"
     else
         GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-}"
     fi
 
-    local arch os tarball base_url
+    local arch os version release_tag tarball base_url checksum_entry
     arch="$(uname -m)"
     case "$arch" in
         x86_64) arch="amd64" ;;
@@ -148,26 +218,32 @@ download_gost() {
     os="$(uname -s | tr '[:upper:]' '[:lower:]')"
     [[ "$os" == "linux" ]] || die "仅支持 Linux"
 
-    tarball="gost_${GOST_VERSION}_${os}_${arch}.tar.gz"
-    base_url="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}"
+    version="${GOST_VERSION#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || \
+        die "GOST_VERSION 格式无效: $GOST_VERSION"
+    release_tag="v${version}"
+    tarball="gost_${version}_${os}_${arch}.tar.gz"
+    base_url="https://github.com/go-gost/gost/releases/download/${release_tag}"
 
-    [[ -n "$GITHUB_PROXY_PREFIX" ]] && base_url="${GITHUB_PROXY_PREFIX}${base_url}"
-
-    echo "下载 GOST ${GOST_VERSION} ..."
+    echo "下载 GOST ${release_tag} ..."
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap "rm -rf '$tmp_dir'" EXIT
+    CLEANUP_PATHS+=("$tmp_dir")
 
-    curl -fsSL -o "$tmp_dir/$tarball" "${base_url}/${tarball}" || die "下载失败"
-    curl -fsSL -o "$tmp_dir/checksums.txt" "${base_url}/checksums.txt" || die "下载 checksums 失败"
+    download_release_file "${base_url}/${tarball}" "$tmp_dir/$tarball" || \
+        die "下载失败: $tarball"
+    download_release_file "${base_url}/checksums.txt" "$tmp_dir/checksums.txt" || \
+        die "下载 checksums.txt 失败"
 
     echo "校验 SHA256..."
     (
         cd "$tmp_dir"
+        checksum_entry="$(awk -v file="$tarball" '$2 == file || $2 == "*" file { print; exit }' checksums.txt)"
+        [[ -n "$checksum_entry" ]] || die "checksums.txt 中缺少 $tarball"
         if command -v sha256sum &>/dev/null; then
-            grep "$tarball" checksums.txt | sha256sum -c - || die "校验失败"
+            printf '%s\n' "$checksum_entry" | sha256sum -c - || die "校验失败"
         elif command -v shasum &>/dev/null; then
-            grep "$tarball" checksums.txt | shasum -a 256 -c - || die "校验失败"
+            printf '%s\n' "$checksum_entry" | shasum -a 256 -c - || die "校验失败"
         else
             die "缺少 sha256sum 或 shasum"
         fi
@@ -193,7 +269,7 @@ install_remote() {
     mkdir -p "$remote_dir"
 
     local mtcp_port
-    read -r -p "Remote MTCP 监听端口 [6600]: " mtcp_port
+    prompt_read mtcp_port "Remote MTCP 监听端口 [6600]: " || die "未输入 MTCP 端口"
     mtcp_port="${mtcp_port:-6600}"
     [[ "$mtcp_port" =~ ^[0-9]+$ ]] && [[ "$mtcp_port" -ge 1 ]] && [[ "$mtcp_port" -le 65535 ]] || die "端口无效"
     [[ "$mtcp_port" -eq 12346 ]] && die "12346 被 Anchor endpoint 占用"
@@ -257,28 +333,28 @@ install_cn() {
 
     echo "配置参数:"
     echo
-    read -r -p "Remote 线路别名（如 de、us，回车=default）: " remote_alias
+    prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
     remote_alias="${remote_alias:-default}"
     [[ "$remote_alias" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || remote_alias="default"
     unit_prefix="gost-mtcp"
     [[ "$remote_alias" != "default" ]] && unit_prefix="gost-mtcp-${remote_alias}"
 
     while :; do
-        read -r -p "Remote IPv4 地址: " remote_ip
+        prompt_read remote_ip "Remote IPv4 地址: " || die "未输入 Remote IPv4 地址"
         [[ "$remote_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
         echo "  无效的 IPv4 地址" >&2
     done
 
-    read -r -p "Remote MTCP 端口 [6600]: " remote_port
+    prompt_read remote_port "Remote MTCP 端口 [6600]: " || die "未输入 Remote MTCP 端口"
     remote_port="${remote_port:-6600}"
 
-    read -r -p "CN 业务监听端口 [12000]: " business_port
+    prompt_read business_port "CN 业务监听端口 [12000]: " || die "未输入 CN 业务监听端口"
     business_port="${business_port:-12000}"
 
-    read -r -p "CN Anchor 监听端口 [12001]: " anchor_port
+    prompt_read anchor_port "CN Anchor 监听端口 [12001]: " || die "未输入 CN Anchor 监听端口"
     anchor_port="${anchor_port:-12001}"
 
-    read -r -p "RTT 快路阈值（ms）[40]: " rtt_threshold
+    prompt_read rtt_threshold "RTT 快路阈值（ms）[40]: " || die "未输入 RTT 阈值"
     rtt_threshold="${rtt_threshold:-40}"
 
     download_gost "cn" "$cn_dir"
@@ -559,7 +635,7 @@ add_cn_relay() {
     local existing_name existing_listen existing_backend existing_chain candidate confirm
 
     while :; do
-        read -r -p "新增 CN 监听端口（例如 12002）: " listen_port || die "未输入监听端口"
+        prompt_read listen_port "新增 CN 监听端口（例如 12002）: " || die "未输入监听端口"
         valid_port "$listen_port" && break
         echo "端口必须是 1-65535 之间的数字。" >&2
     done
@@ -568,12 +644,12 @@ add_cn_relay() {
     [[ "$listen_port" != "$CN_ANCHOR_PORT" ]] || die "$listen_port 是受保护的 Anchor 端口"
 
     while :; do
-        read -r -p "Remote 后端地址（例如 127.0.0.1:2347）: " backend || die "未输入后端地址"
+        prompt_read backend "Remote 后端地址（例如 127.0.0.1:2347）: " || die "未输入后端地址"
         validate_backend_addr "$backend" && break
         echo "后端地址格式无效，请使用 host:port 或 [IPv6]:port。" >&2
     done
     default_name="relay-$listen_port"
-    read -r -p "Relay 服务名 [$default_name]: " service_name || die "未输入服务名"
+    prompt_read service_name "Relay 服务名 [$default_name]: " || die "未输入服务名"
     service_name="${service_name:-$default_name}"
     [[ "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
         die "服务名只能包含字母、数字、下划线和连字符"
@@ -588,7 +664,7 @@ add_cn_relay() {
     fi
 
     echo "将增加: :$listen_port -> ${backend}（service=${service_name}，共用 chain-mtcp）"
-    read -r -p "确认修改并重启 ${CN_RELAY_UNIT}？[y/N]: " confirm || die "操作已取消"
+    prompt_read confirm "确认修改并重启 ${CN_RELAY_UNIT}？[y/N]: " || die "操作已取消"
     case "$confirm" in y|Y|yes|YES) ;; *) echo "已取消。"; return 0 ;; esac
 
     candidate="$(mktemp "$CN_RELAY_DIR/.cn.yaml.relay.XXXXXX")"
@@ -642,7 +718,7 @@ remove_cn_relay() {
             printf '  %d) %s  %s -> %s\n' "$index" "$name" "$listen" "$backend"
             index=$((index + 1))
         done
-        read -r -p "请选择编号: " choice || die "未选择 Relay"
+        prompt_read choice "请选择编号: " || die "未选择 Relay"
         [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )) || \
             die "选择无效"
         requested="${candidates[$((choice - 1))]%%$'\t'*}"
@@ -655,7 +731,7 @@ remove_cn_relay() {
     [[ -n "$line" ]] || die "未找到可删除 Relay: $requested"
     IFS=$'\t' read -r name listen backend chain <<< "$line"
 
-    read -r -p "确认删除 ${name}（$listen -> ${backend}）并重启 ${CN_RELAY_UNIT}？[y/N]: " confirm || \
+    prompt_read confirm "确认删除 ${name}（$listen -> ${backend}）并重启 ${CN_RELAY_UNIT}？[y/N]: " || \
         die "操作已取消"
     case "$confirm" in y|Y|yes|YES) ;; *) echo "已取消。"; return 0 ;; esac
 
@@ -702,7 +778,7 @@ manage_cn_relays() {
   3) 刷新列表
   q) 返回
 RELAY_MENU
-                read -r -p "请选择 [1/2/3/q]: " choice || return 0
+                prompt_read choice "请选择 [1/2/3/q]: " || return 0
                 case "$choice" in
                     1) add_cn_relay ;;
                     2) remove_cn_relay ;;
@@ -718,6 +794,8 @@ RELAY_MENU
 
 main() {
     local SELECTED_ROLE="" RELAY_ACTION="" RELAY_TARGET=""
+
+    prepare_embedded_source
 
     case "${1:-}" in
         --help|-h)
@@ -757,6 +835,7 @@ main() {
 }
 
 main "$@"
+exit $?
 
 # ============================================================
 # 嵌入文件内容

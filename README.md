@@ -57,6 +57,9 @@ curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/9929-gost-mtcp/m
 # 按提示输入 Remote IP、端口和 RTT 阈值（默认 40ms）
 ```
 
+管道安装会从当前终端读取交互输入，因此请直接在 SSH/终端中执行，不要再给命令重定向 stdin。
+`GOST_VERSION=v3.2.6` 中的 `v` 只用于 Release tag，安装器会自动使用不带 `v` 的资产文件名。
+
 **传统方式（开发/调试）**
 
 ```bash
