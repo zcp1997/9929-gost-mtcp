@@ -77,6 +77,10 @@ ANCHOR_PORT="45101"
 LEGACY
     PROMPTS=(jp 45.142.125.253 5201 45100 45101 40); PROMPT_INDEX=0
     install_cn >/dev/null
+    unset CN_INSTANCE CN_YAML_PATH CN_MTCP_CONFIG_PATH
+    resolve_cn_relay_context
+    [[ "$CN_RELAY_YAML" == "$INSTALL_BASE/cn/instances/jp/cn.yaml" ]] || \
+        fail "Relay resolver preferred legacy flat config after migration"
     PROMPTS=(us 198.51.100.20 6600 45102 45103 45); PROMPT_INDEX=0
     install_cn >/dev/null
 

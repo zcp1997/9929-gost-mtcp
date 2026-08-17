@@ -573,9 +573,6 @@ resolve_cn_relay_context() {
     elif [[ -n "${CN_INSTANCE:-}" ]]; then
         [[ "$CN_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "CN_INSTANCE 无效"
         CN_RELAY_YAML="$INSTALL_BASE/cn/instances/$CN_INSTANCE/cn.yaml"
-    elif [[ -r "$INSTALL_BASE/cn/cn.yaml" ]]; then
-        # 兼容 v1.1 及更早的单目录安装。
-        CN_RELAY_YAML="$INSTALL_BASE/cn/cn.yaml"
     else
         local path
         local -a candidates=()
@@ -588,6 +585,9 @@ resolve_cn_relay_context() {
             echo "检测到多条 CN 线路：" >&2
             for path in "${candidates[@]}"; do echo "  $(basename "$(dirname "$path")")" >&2; done
             die "请用 CN_INSTANCE=<线路别名> 指定 Relay 管理目标"
+        elif [[ -r "$INSTALL_BASE/cn/cn.yaml" ]]; then
+            # 仅在还没有新版实例时兼容 v1.1 及更早的单目录安装，避免迁移后误改旧文件。
+            CN_RELAY_YAML="$INSTALL_BASE/cn/cn.yaml"
         else
             CN_RELAY_YAML="$INSTALL_BASE/cn.yaml"
         fi
