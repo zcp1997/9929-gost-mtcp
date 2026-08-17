@@ -44,6 +44,12 @@ reset_runtime_state() {
     ZERO_SINCE=0; WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0
     LAST_REMOTE_PROBE=0; REMOTE_OK="unknown"; LAST_RESTART=0; MULTI_SEEN=0
     LAST_DEGRADED_RETRY=0; LAST_RECOVERY_ATTEMPT=0; LAST_ANCHOR_RETRY=0; LAST_PRUNE=0
+    BUSINESS_IDLE_SINCE=0
+    DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+    DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+    LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     reset_data_probe_state
     HAVE_RUNTIME=0
 }
@@ -71,10 +77,36 @@ load_runtime_state() {
     : "${DATA_PROBE_FAILS:=0}"
     : "${DATA_PLANE_OK:=unknown}"
     : "${DATA_PROBE_SPORT:=}"
+    : "${BUSINESS_IDLE_SINCE:=0}"
+    : "${DATA_PROBE_RESTART_EPOCHS:=}"
+    : "${DATA_PROBE_BREAKER_STATE:=closed}"
+    : "${DATA_PROBE_BREAKER_UNTIL:=0}"
+    : "${DATA_PROBE_BREAKER_LOGGED:=0}"
+    : "${PROCESS_RECOVERY_EPOCHS:=}"
+    : "${PROCESS_BREAKER_STATE:=closed}"
+    : "${PROCESS_BREAKER_UNTIL:=0}"
+    : "${PROCESS_BREAKER_LOGGED:=0}"
+    : "${LAST_PROCESS_RECOVERY:=0}"
+    : "${PROCESS_HEALTHY_SINCE:=0}"
+    : "${PROCESS_DOWN_SINCE:=0}"
     if [[ ! "$LAST_DATA_PROBE" =~ ^[0-9]+$ || ! "$DATA_PROBE_FAILS" =~ ^[0-9]+$ ]] ||
        [[ "$DATA_PLANE_OK" != "yes" && "$DATA_PLANE_OK" != "no" && "$DATA_PLANE_OK" != "unknown" ]] ||
        [[ -n "$DATA_PROBE_SPORT" && ! "$DATA_PROBE_SPORT" =~ ^[0-9]+$ ]]; then
         reset_data_probe_state
+    fi
+    if [[ ! "$BUSINESS_IDLE_SINCE" =~ ^[0-9]+$ || ! "$DATA_PROBE_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ || ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ || ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ||
+          ! "$PROCESS_HEALTHY_SINCE" =~ ^[0-9]+$ || ! "$PROCESS_DOWN_SINCE" =~ ^[0-9]+$ ]] ||
+       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] || "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]] ||
+       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+        BUSINESS_IDLE_SINCE=0
+        DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+        DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+        PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+        PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+        LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     fi
     HAVE_RUNTIME=1
     return 0
@@ -101,12 +133,152 @@ LAST_DEGRADED_RETRY='$LAST_DEGRADED_RETRY'
 LAST_RECOVERY_ATTEMPT='$LAST_RECOVERY_ATTEMPT'
 LAST_ANCHOR_RETRY='$LAST_ANCHOR_RETRY'
 LAST_PRUNE='$LAST_PRUNE'
+BUSINESS_IDLE_SINCE='$BUSINESS_IDLE_SINCE'
 LAST_DATA_PROBE='$LAST_DATA_PROBE'
 DATA_PROBE_FAILS='$DATA_PROBE_FAILS'
 DATA_PLANE_OK='$DATA_PLANE_OK'
 DATA_PROBE_SPORT='$DATA_PROBE_SPORT'
+DATA_PROBE_RESTART_EPOCHS='$DATA_PROBE_RESTART_EPOCHS'
+DATA_PROBE_BREAKER_STATE='$DATA_PROBE_BREAKER_STATE'
+DATA_PROBE_BREAKER_UNTIL='$DATA_PROBE_BREAKER_UNTIL'
+DATA_PROBE_BREAKER_LOGGED='$DATA_PROBE_BREAKER_LOGGED'
+PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
+PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
+PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
+PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
+LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
+PROCESS_HEALTHY_SINCE='$PROCESS_HEALTHY_SINCE'
+PROCESS_DOWN_SINCE='$PROCESS_DOWN_SINCE'
 STATEEOF
     mv -f "$tmp" "$STATE_FILE"
+}
+
+prune_epoch_list() {
+    local epochs="$1" cutoff="$2" epoch kept=""
+    for epoch in $epochs; do
+        (( epoch >= cutoff )) && kept="${kept:+$kept }$epoch"
+    done
+    printf '%s\n' "$kept"
+}
+
+close_data_probe_breaker() {
+    if [[ "$DATA_PROBE_BREAKER_STATE" != "closed" || -n "$DATA_PROBE_RESTART_EPOCHS" ]]; then
+        log_event "$STATE" "DATA_PROBE_BREAKER_CLOSED" "DATA_PLANE" "$LAST_PID" "$LAST_SPORT"
+    fi
+    DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+    DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+}
+
+allow_data_probe_restart() {
+    local now="$1" cutoff count half_open=0
+    if [[ "$DATA_PROBE_BREAKER_STATE" == "open" ]]; then
+        if (( now < DATA_PROBE_BREAKER_UNTIL )); then
+            if (( DATA_PROBE_BREAKER_LOGGED == 0 )); then
+                log_event "FAULT" "DATA_PROBE_BREAKER_SUPPRESSED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+                    "until=$DATA_PROBE_BREAKER_UNTIL"
+                DATA_PROBE_BREAKER_LOGGED=1
+            fi
+            return 1
+        fi
+        # 熔断时间到期只放行一次试探；若数据面仍坏，下一轮仍会被抑制。
+        DATA_PROBE_RESTART_EPOCHS=""
+        DATA_PROBE_BREAKER_STATE="closed"; DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+        half_open=1
+        log_event "FAULT" "DATA_PROBE_BREAKER_HALF_OPEN" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT"
+    fi
+
+    cutoff=$((now - DATA_PROBE_RESTART_WINDOW_SEC))
+    DATA_PROBE_RESTART_EPOCHS="$(prune_epoch_list "$DATA_PROBE_RESTART_EPOCHS" "$cutoff")"
+    count=0; [[ -n "$DATA_PROBE_RESTART_EPOCHS" ]] && count="$(wc -w <<< "$DATA_PROBE_RESTART_EPOCHS" | tr -d ' ')"
+    if (( count >= DATA_PROBE_RESTART_MAX )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_OPEN" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "attempts=$count window=${DATA_PROBE_RESTART_WINDOW_SEC}s until=$DATA_PROBE_BREAKER_UNTIL"
+        return 1
+    fi
+
+    DATA_PROBE_RESTART_EPOCHS="${DATA_PROBE_RESTART_EPOCHS:+$DATA_PROBE_RESTART_EPOCHS }$now"
+    count=$((count + 1))
+    if (( half_open == 1 )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_REARMED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "half_open_attempt=yes until=$DATA_PROBE_BREAKER_UNTIL"
+    elif (( count >= DATA_PROBE_RESTART_MAX )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_ARMED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "attempts=$count window=${DATA_PROBE_RESTART_WINDOW_SEC}s until=$DATA_PROBE_BREAKER_UNTIL"
+    fi
+    return 0
+}
+
+close_process_breaker() {
+    if [[ "$PROCESS_BREAKER_STATE" != "closed" || -n "$PROCESS_RECOVERY_EPOCHS" ]]; then
+        log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    fi
+    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0; LAST_PROCESS_RECOVERY=0
+}
+
+allow_process_recovery() {
+    local now="$1" cutoff count half_open=0
+    if (( LAST_PROCESS_RECOVERY > 0 && now - LAST_PROCESS_RECOVERY < PROCESS_RECOVERY_INTERVAL_SEC )); then
+        return 1
+    fi
+    if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
+        if (( now < PROCESS_BREAKER_UNTIL )); then
+            if (( PROCESS_BREAKER_LOGGED == 0 )); then
+                log_event "FAULT" "PROCESS_BREAKER_SUPPRESSED" "PROCESS" 0 "" "" "" "until=$PROCESS_BREAKER_UNTIL"
+                PROCESS_BREAKER_LOGGED=1
+            fi
+            return 1
+        fi
+        PROCESS_RECOVERY_EPOCHS=""
+        PROCESS_BREAKER_STATE="closed"; PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+        half_open=1
+        log_event "FAULT" "PROCESS_BREAKER_HALF_OPEN" "PROCESS" 0
+    fi
+    cutoff=$((now - PROCESS_RECOVERY_WINDOW_SEC))
+    PROCESS_RECOVERY_EPOCHS="$(prune_epoch_list "$PROCESS_RECOVERY_EPOCHS" "$cutoff")"
+    count=0; [[ -n "$PROCESS_RECOVERY_EPOCHS" ]] && count="$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
+    if (( count >= PROCESS_RECOVERY_MAX )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_OPEN" "PROCESS" 0 "" "" "" \
+            "attempts=$count window=${PROCESS_RECOVERY_WINDOW_SEC}s until=$PROCESS_BREAKER_UNTIL"
+        return 1
+    fi
+    LAST_PROCESS_RECOVERY="$now"
+    PROCESS_RECOVERY_EPOCHS="${PROCESS_RECOVERY_EPOCHS:+$PROCESS_RECOVERY_EPOCHS }$now"
+    count=$((count + 1))
+    if (( half_open == 1 )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_REARMED" "PROCESS" 0 "" "" "" \
+            "half_open_attempt=yes until=$PROCESS_BREAKER_UNTIL"
+    elif (( count >= PROCESS_RECOVERY_MAX )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_ARMED" "PROCESS" 0 "" "" "" \
+            "attempts=$count window=${PROCESS_RECOVERY_WINDOW_SEC}s until=$PROCESS_BREAKER_UNTIL"
+    fi
+    return 0
+}
+
+recover_process_rate_limited() {
+    local now="$1"
+    allow_process_recovery "$now" || return 1
+    log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
+        "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
+    systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+    if ! systemctl restart "$UNIT"; then
+        log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
+        return 2
+    fi
+    log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
+    return 0
 }
 
 set_state() {
@@ -127,6 +299,9 @@ restart_gost_rate_limited() {
     if (( LAST_RESTART > 0 && now - LAST_RESTART < ${RESTART_COOLDOWN_SEC:-300} )); then
         log_event "FAULT" "RESTART_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
         return 1
+    fi
+    if [[ "$reason" == "DATA_PLANE_STALE_OUTER" ]] && ! allow_data_probe_restart "$now"; then
+        return 3
     fi
     LAST_RESTART="$now"
     stop_anchor
@@ -229,10 +404,26 @@ while true; do
         stop_anchor
         (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
         LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0
+        PROCESS_HEALTHY_SINCE=0
+        (( PROCESS_DOWN_SINCE == 0 )) && PROCESS_DOWN_SINCE="$now"
         reset_data_probe_state
         DATA_PLANE_OK="no"
         set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
+        if (( now - PROCESS_DOWN_SINCE >= PROCESS_RECOVERY_GRACE_SEC )); then
+            recover_process_rate_limited "$now" || true
+        fi
+        if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
+            set_state "FAULT" "PROCESS_BREAKER" "$pid" "" "" "" 0
+        fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+    fi
+
+    PROCESS_DOWN_SINCE=0
+
+    if (( PROCESS_HEALTHY_SINCE == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
+    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
+        close_process_breaker
     fi
 
     # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。
@@ -388,6 +579,7 @@ while true; do
             reset_data_probe_state
         fi
         # 显式关闭新探测时保持旧版 outer=1 的兼容语义。
+        close_data_probe_breaker
         REMOTE_OK="yes"
     else
         probe_threshold="$DATA_PROBE_FAIL_THRESHOLD"
@@ -414,6 +606,7 @@ while true; do
                         previous_failures="$DATA_PROBE_FAILS"
                         DATA_PROBE_FAILS=0
                         DATA_PLANE_OK="yes"
+                        close_data_probe_breaker
                         log_event "$STATE" "DATA_PROBE_RECOVERED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" "previous_failures=$previous_failures"
                     else
@@ -424,7 +617,11 @@ while true; do
                         log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" \
                             "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                        restart_rc=$?
+                        if (( restart_rc == 3 )); then
+                            set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                        fi
                         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
                     fi
                 fi
@@ -448,6 +645,7 @@ while true; do
                 DATA_PROBE_FAILS=0
                 DATA_PLANE_OK="yes"
                 REMOTE_OK="yes"
+                close_data_probe_breaker
             else
                 DATA_PLANE_OK="no"
                 if (( DATA_PROBE_FAILS < probe_threshold )); then
@@ -472,7 +670,11 @@ while true; do
                     log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                         "$pid" "$sport" "$minrtt" "$rtt" \
                         "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                    restart_rc=$?
+                    if (( restart_rc == 3 )); then
+                        set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                    fi
                 else
                     REMOTE_OK="no"
                     [[ "$old_remote" == "no" ]] || \
@@ -511,17 +713,25 @@ while true; do
         if (( LAST_DEGRADED_RETRY == 0 )); then LAST_DEGRADED_RETRY="$now"; fi
         if (( now - LAST_DEGRADED_RETRY >= ${DEGRADED_RETRY_SEC:-900} )); then
             if (( business == 0 )); then
-                LAST_DEGRADED_RETRY="$now"
-                log_event "DEGRADED" "DEGRADED_RETRY_IDLE" "PATH" "$pid" "$sport" "$minrtt" "$rtt"
-                run_select degraded-retry "DEGRADED_IDLE_RETRY" || true
-                save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                if (( BUSINESS_IDLE_SINCE == 0 )); then
+                    BUSINESS_IDLE_SINCE="$now"
+                elif (( now - BUSINESS_IDLE_SINCE >= BUSINESS_IDLE_HOLD_SEC )); then
+                    LAST_DEGRADED_RETRY="$now"
+                    log_event "DEGRADED" "DEGRADED_RETRY_IDLE" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+                        "idle_for=$((now - BUSINESS_IDLE_SINCE))s ports=$BUSINESS_PORTS"
+                    run_select degraded-retry "DEGRADED_IDLE_RETRY" || true
+                    BUSINESS_IDLE_SINCE=0
+                    save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                fi
             else
+                BUSINESS_IDLE_SINCE=0
                 LAST_DEGRADED_RETRY=$((now - ${DEGRADED_RETRY_SEC:-900} + ${DEGRADED_BUSY_DEFER_SEC:-60}))
-                log_event "DEGRADED" "DEGRADED_RETRY_DEFER_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "business=$business"
+                log_event "DEGRADED" "DEGRADED_RETRY_DEFER_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+                    "business=$business ports=$BUSINESS_PORTS"
             fi
         fi
     else
-        LAST_DEGRADED_RETRY=0
+        LAST_DEGRADED_RETRY=0; BUSINESS_IDLE_SINCE=0
     fi
 
     # LIVE RTT 只做状态化，不主动 kill 当前 outer。

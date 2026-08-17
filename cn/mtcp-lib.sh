@@ -3,7 +3,7 @@ set -uo pipefail
 
 CONFIG_DEFAULT="/root/9929-gost-mtcp/cn/mtcp.conf"
 CONFIG_KEYS=(
-    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT
+    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
     LIVE_RTT_WARN_MS LIVE_RTT_CRIT_MS LIVE_RTT_WARN_HOLD_SEC
     LIVE_RTT_CRIT_HOLD_SEC LIVE_RTT_RECOVER_MS LIVE_RTT_RECOVER_HOLD_SEC
@@ -11,12 +11,15 @@ CONFIG_KEYS=(
     PREWARM_NO_SESSION_ATTEMPTS PREWARM_CONNECT_WAIT_SEC PREWARM_STABLE_REQUIRED
     PREWARM_STABLE_INTERVAL_SEC PREWARM_KILL_WAIT_SEC PREWARM_TOTAL_TIMEOUT_SEC
     ANCHOR_START_TIMEOUT_SEC ANCHOR_STABLE_REQUIRED ANCHOR_STABLE_INTERVAL_SEC
-    ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC
+    ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC BUSINESS_IDLE_HOLD_SEC
     WATCH_INTERVAL_SEC ZERO_GRACE_SEC REMOTE_PROBE_INTERVAL_SEC
     REMOTE_PROBE_TIMEOUT_SEC REMOTE_PROBE_ATTEMPTS DOWN_RETRY_SEC
     DATA_PROBE_ENABLED DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC
-    DATA_PROBE_FAIL_THRESHOLD
+    DATA_PROBE_FAIL_THRESHOLD DATA_PROBE_RESTART_WINDOW_SEC DATA_PROBE_RESTART_MAX
+    DATA_PROBE_BREAKER_OPEN_SEC
     STUCK_RESTART_AFTER_SEC RESTART_COOLDOWN_SEC MULTI_CONFIRM_COUNT
+    PROCESS_RECOVERY_GRACE_SEC PROCESS_RECOVERY_INTERVAL_SEC PROCESS_RECOVERY_WINDOW_SEC PROCESS_RECOVERY_MAX
+    PROCESS_BREAKER_OPEN_SEC
     STATE_DIR STATE_FILE STATUS_JSON EVENT_FILE RETENTION_SEC
 )
 
@@ -43,16 +46,52 @@ load_config() {
     EVENT_FILE="${EVENT_FILE:-${STATE_DIR}/events.jsonl}"
     RETENTION_SEC="${RETENTION_SEC:-86400}"
 
+    BUSINESS_PORTS="${BUSINESS_PORTS:-$BUSINESS_PORT}"
+    BUSINESS_PORTS="${BUSINESS_PORTS//,/ }"
+    local port seen=" " normalized="" found_primary=no
+    for port in $BUSINESS_PORTS; do
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            echo "invalid port in BUSINESS_PORTS: $port" >&2
+            return 1
+        fi
+        [[ "$port" == "$ANCHOR_PORT" ]] && {
+            echo "BUSINESS_PORTS must not contain ANCHOR_PORT: $port" >&2
+            return 1
+        }
+        [[ "$port" == "$BUSINESS_PORT" ]] && found_primary=yes
+        if [[ "$seen" != *" $port "* ]]; then
+            normalized="${normalized:+$normalized }$port"
+            seen+="$port "
+        fi
+    done
+    [[ -n "$normalized" && "$found_primary" == yes ]] || {
+        echo "BUSINESS_PORTS must include BUSINESS_PORT ($BUSINESS_PORT)" >&2
+        return 1
+    }
+    BUSINESS_PORTS="$normalized"
+
     DATA_PROBE_ENABLED="${DATA_PROBE_ENABLED:-yes}"
     DATA_PROBE_INTERVAL_SEC="${DATA_PROBE_INTERVAL_SEC:-15}"
     DATA_PROBE_TIMEOUT_SEC="${DATA_PROBE_TIMEOUT_SEC:-3}"
     DATA_PROBE_FAIL_THRESHOLD="${DATA_PROBE_FAIL_THRESHOLD:-3}"
+    DATA_PROBE_RESTART_WINDOW_SEC="${DATA_PROBE_RESTART_WINDOW_SEC:-600}"
+    DATA_PROBE_RESTART_MAX="${DATA_PROBE_RESTART_MAX:-3}"
+    DATA_PROBE_BREAKER_OPEN_SEC="${DATA_PROBE_BREAKER_OPEN_SEC:-600}"
+    BUSINESS_IDLE_HOLD_SEC="${BUSINESS_IDLE_HOLD_SEC:-15}"
+    PROCESS_RECOVERY_GRACE_SEC="${PROCESS_RECOVERY_GRACE_SEC:-10}"
+    PROCESS_RECOVERY_INTERVAL_SEC="${PROCESS_RECOVERY_INTERVAL_SEC:-60}"
+    PROCESS_RECOVERY_WINDOW_SEC="${PROCESS_RECOVERY_WINDOW_SEC:-600}"
+    PROCESS_RECOVERY_MAX="${PROCESS_RECOVERY_MAX:-3}"
+    PROCESS_BREAKER_OPEN_SEC="${PROCESS_BREAKER_OPEN_SEC:-600}"
     case "$DATA_PROBE_ENABLED" in
       yes|no) ;;
       *) echo "DATA_PROBE_ENABLED must be yes or no in config: $cfg" >&2; return 1 ;;
     esac
     local probe_key
-    for probe_key in DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC DATA_PROBE_FAIL_THRESHOLD; do
+    for probe_key in DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC DATA_PROBE_FAIL_THRESHOLD \
+      DATA_PROBE_RESTART_WINDOW_SEC DATA_PROBE_RESTART_MAX DATA_PROBE_BREAKER_OPEN_SEC \
+      BUSINESS_IDLE_HOLD_SEC PROCESS_RECOVERY_GRACE_SEC PROCESS_RECOVERY_INTERVAL_SEC PROCESS_RECOVERY_WINDOW_SEC \
+      PROCESS_RECOVERY_MAX PROCESS_BREAKER_OPEN_SEC; do
         if [[ ! "${!probe_key}" =~ ^[1-9][0-9]*$ ]]; then
             echo "$probe_key must be a positive integer in config: $cfg" >&2
             return 1
@@ -132,8 +171,16 @@ is_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }
 get_business_conn_count() {
     local pid="$1"
     (( pid > 0 )) || { echo 0; return; }
-    ss -ntpH "sport = :${BUSINESS_PORT}" 2>/dev/null |
-      awk -v needle="pid=${pid}," '$1=="ESTAB" && index($0,needle){n++} END{print n+0}'
+    # 单次抓取避免逐端口查询之间的时间差；只统计当前 GOST PID 的本地业务入口。
+    ss -ntpH state established 2>/dev/null |
+      awk -v needle="pid=${pid}," -v ports="$BUSINESS_PORTS" '
+        BEGIN { nports=split(ports,p,/ +/); for (i=1;i<=nports;i++) wanted[p[i]]=1 }
+        index($0,needle) {
+          ep=$4; sub(/^.*:/,"",ep)
+          if (wanted[ep]) n++
+        }
+        END { print n+0 }
+      '
 }
 
 get_anchor_conn_count() {
@@ -225,15 +272,19 @@ write_status_json() {
     local minrtt="${5:-}" rtt="${6:-}" outer="${7:-0}" remote="${8:-unknown}"
     local data_plane="${9:-unknown}" data_failures="${10:-0}"
     local apid acount business astate tmp epoch ts
+    local data_breaker process_breaker
     [[ "$data_failures" =~ ^[0-9]+$ ]] || data_failures=0
     apid="$(get_anchor_pid)"; acount="$(get_anchor_conn_count "$apid")"
     business="$(get_business_conn_count "$pid")"
+    data_breaker="${DATA_PROBE_BREAKER_STATE:-closed}"
+    process_breaker="${PROCESS_BREAKER_STATE:-closed}"
     if (( apid > 0 && acount == 1 )); then astate="up"; elif (( apid > 0 )); then astate="starting"; else astate="down"; fi
     epoch="$(now_epoch)"; ts="$(now_text)"; tmp="${STATUS_JSON}.tmp.$$"
-    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
+    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
       "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$UNIT")" \
-      "$(json_escape "$DST")" "$PORT" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
-      "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
+      "$(json_escape "$DST")" "$PORT" "$(json_escape "$BUSINESS_PORTS")" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
+      "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$data_breaker")" \
+      "$(json_escape "$process_breaker")" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
       "${apid:-0}" "${acount:-0}" "${business:-0}" > "$tmp"
     mv -f "$tmp" "$STATUS_JSON"
 }

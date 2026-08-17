@@ -20,8 +20,28 @@ LOCK="/run/${LOCK_ID}-prewarm.lock"
 exec {LOCKFD}>"$LOCK"
 flock -n "$LOCKFD" || exit 75
 
+abort_degraded_retry_if_busy() {
+    local phase="$1" pid business count sport info minrtt rtt
+    [[ "$MODE" == "degraded-retry" ]] || return 1
+    pid="$(get_main_pid)"
+    business="$(get_business_conn_count "$pid")"
+    (( business > 0 )) || return 1
+
+    # Watchdog 的 idle 判断与真正切路之间存在时间窗。这里是 destructive
+    # action 前的最后一道闸：一旦业务出现，恢复/保持 Anchor 并保留当前 outer。
+    ensure_anchor || true
+    count="$(get_gost_outer_count "$pid")"
+    sport="$(get_single_sport "$pid" 2>/dev/null || true)"
+    info="$(get_tcp_info "$sport")"; minrtt="${info%%|*}"; rtt="${info#*|}"
+    write_status_json "DEGRADED" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "$count" "yes"
+    log_event "DEGRADED" "PREWARM_ABORT_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+        "mode=$MODE phase=$phase business=$business"
+    exit 10
+}
+
 # v1：Anchor 本身负责建立候选 outer 并在成功后直接留下。
 # 抽慢路时先 stop Anchor，再 kill 当前唯一 outer；避免自动重连竞争。
+abort_degraded_retry_if_busy "before_initial_anchor_stop"
 stop_anchor
 
 start_epoch="$(now_epoch)"
@@ -124,6 +144,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
     log_event "DEGRADED" "PREWARM_REJECT_SLOW" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "mode=$MODE attempt=$attempt/$MAX_DRAWS"
 
     # 先停 Anchor；如果 outer 因最后一个 logical stream 消失而自己释放，就无需再 ss -K。
+    abort_degraded_retry_if_busy "before_anchor_stop"
     stop_anchor
     sleep 0.1
 
@@ -146,6 +167,8 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
         candidate_sport=""; stable=0
         continue
     fi
+
+    abort_degraded_retry_if_busy "before_outer_kill"
 
     if ! kill_outer_sport "$pid" "$sport"; then
         # 再看一次：若恰好自然消失，按成功清理处理；否则才是故障。

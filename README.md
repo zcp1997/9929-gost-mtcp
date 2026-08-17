@@ -111,10 +111,10 @@ systemctl status gost-mtcp-jp.service
 systemctl status gost-mtcp-jp-watchdog.service
 
 # 查看状态
-cat /opt/gost-mtcp/cn/state/status.json
+cat /opt/gost-mtcp/cn/instances/jp/state/status.json
 
 # 查看事件日志
-tail -f /opt/gost-mtcp/cn/state/events.jsonl
+tail -f /opt/gost-mtcp/cn/instances/jp/state/events.jsonl
 
 # 查看 outer 连接（替换实际 IP 和端口）
 ss -tin state established 'dst <REMOTE_IP> dport = :6600'
@@ -126,6 +126,8 @@ ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 - `minrtt_ms < 40` - 快路
 - `data_plane_reachable: yes` - 当前 MTCP 数据面能完成真实 payload 往返
 - `data_probe_failures: 0` - 连续数据面探测失败次数
+- `data_probe_breaker: closed` - stale outer 重启熔断器未打开
+- `process_breaker: closed` - GOST 进程恢复熔断器未打开
 - `anchor_state: up` - Anchor 正常
 
 ## 常见配置
@@ -136,7 +138,7 @@ CN 的 `forwarder.nodes[0].addr` 指向 Remote 要连接的最终 TCP 目标。
 
 ```bash
 # 单文件安装器默认路径
-nano /opt/gost-mtcp/cn/cn.yaml
+nano /opt/gost-mtcp/cn/instances/jp/cn.yaml
 
 # 或传统方式路径
 nano /root/9929-gost-mtcp/cn/cn.yaml
@@ -154,7 +156,7 @@ systemctl restart gost-mtcp-jp.service
 ### 修改 RTT 阈值
 
 ```bash
-nano /opt/gost-mtcp/cn/mtcp.conf
+nano /opt/gost-mtcp/cn/instances/jp/mtcp.conf
 
 # 修改阈值
 ACCEPT_RTT_MS=35
@@ -177,9 +179,18 @@ DATA_PROBE_ENABLED=yes
 DATA_PROBE_INTERVAL_SEC=15
 DATA_PROBE_TIMEOUT_SEC=3
 DATA_PROBE_FAIL_THRESHOLD=3
+DATA_PROBE_RESTART_WINDOW_SEC=600
+DATA_PROBE_RESTART_MAX=3
+DATA_PROBE_BREAKER_OPEN_SEC=600
 ```
 
 将 `DATA_PROBE_ENABLED` 改为 `no` 可以恢复旧版只观察 outer TCP 的行为。
+若探测 endpoint 配错或持续故障，10 分钟内因 stale outer 重启 3 次后会进入
+`FAULT/DATA_PROBE_BREAKER`，停止重启 10 分钟；随后只放行一次 half-open 试探，数据面
+探测成功才关闭熔断器。
+
+GOST 触发 systemd `StartLimit` 后，Watchdog 会低频执行 `reset-failed + restart`；默认
+10 分钟最多 3 次，之后进入 `FAULT/PROCESS_BREAKER`。进程持续健康 60 秒后自动关闭熔断器。
 
 ### 故障恢复路径（均已实测）
 
@@ -299,6 +310,19 @@ bash standalone-install.sh cn
 # 别名: us, 业务端口: 12002, Anchor: 12003
 ```
 
+每条线路拥有独立配置和状态，只有 GOST 二进制及运行脚本共享：
+
+```text
+/opt/gost-mtcp/cn/
+├── gost, mtcp-lib.sh, mtcp-prewarm.sh, mtcp-watchdog.sh
+└── instances/
+    ├── jp/  -> cn.yaml, mtcp.conf, state/
+    └── us/  -> cn.yaml, mtcp.conf, state/
+```
+
+为避免运行中的 GOST 与 Watchdog 分别读到新旧配置，安装器不会覆盖 active 线路。
+重装前先停止提示中列出的 main、Anchor 和 Watchdog unit；Remote 重装采用相同保护。
+
 ### 管理 CN 额外端口 Relay
 
 standalone 安装器可以在不手工编辑 YAML 的情况下列出、增加和删除额外业务入口。
@@ -322,9 +346,10 @@ Remote 后端地址: 127.0.0.1:2347
 Relay 服务名: relay-12002
 ```
 
-会生成 `:12002 → chain-mtcp → 127.0.0.1:2347`。修改前会备份 `cn.yaml`；
-脚本随后重启对应 GOST unit，如果服务未恢复 active 会自动回滚。主业务端口和
-Anchor 端口不能通过 Relay 管理器删除或覆盖。
+会生成 `:12002 → chain-mtcp → 127.0.0.1:2347`，同时把 `12002` 写入
+`BUSINESS_PORTS`。`cn.yaml` 与 `mtcp.conf` 会一起备份、一起替换；GOST 未恢复 active
+时两者一起回滚。Watchdog 通过一次 `ss` 快照统计所有业务端口，慢路重抽前还会在
+Prewarm 内再次确认业务仍为空闲。主业务端口和 Anchor 端口不能删除或覆盖。
 
 如安装目录不是默认的 `/opt/gost-mtcp`，管理时传入相同环境变量：
 
@@ -332,9 +357,14 @@ Anchor 端口不能通过 Relay 管理器删除或覆盖。
 INSTALL_BASE=/root/mtcpjpv22 bash standalone-install.sh relay
 ```
 
-管理器会自动识别 `$INSTALL_BASE/cn/cn.yaml` 和类似你当前
-`$INSTALL_BASE/cn.yaml` 的平铺布局；也可以用 `CN_YAML_PATH`、
-`CN_MTCP_CONFIG_PATH` 显式指定两个配置文件。
+只有一个实例时管理器会自动识别；存在多条线路时必须指定目标：
+
+```bash
+CN_INSTANCE=jp bash standalone-install.sh relay
+```
+
+旧版 `$INSTALL_BASE/cn/cn.yaml` 和平铺布局仍兼容；也可用 `CN_YAML_PATH`、
+`CN_MTCP_CONFIG_PATH` 显式指定两个文件。
 
 ## 重要注意事项
 
@@ -428,6 +458,10 @@ v2.2 采用 **Prewarm + Anchor + Watchdog** 三层架构：
 9929-gost-mtcp/
 ├── standalone-install.sh      # 单文件自包含安装器
 ├── install.sh                  # 传统安装器（需要完整项目）
+├── scripts/
+│   └── generate-standalone.sh # 从 canonical 文件生成 standalone 嵌入区
+├── tests/
+│   └── run.sh                 # shell、生成一致性和关键保护回归检查
 ├── cn/                         # CN 端配置和脚本
 │   ├── cn.yaml
 │   ├── mtcp.conf
@@ -439,6 +473,10 @@ v2.2 采用 **Prewarm + Anchor + Watchdog** 三层架构：
     ├── remote.yaml
     └── *.service
 ```
+
+`cn/` 与 `remote/` 是运行配置、脚本和 systemd 的唯一来源。修改这些 canonical 文件后
+运行 `scripts/generate-standalone.sh`；CI/本地可用 `scripts/generate-standalone.sh --check`
+确认 standalone 没有漂移。
 
 ## 许可证
 

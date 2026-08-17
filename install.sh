@@ -362,7 +362,7 @@ install_cn() {
     PORT_CONFLICT_KEY=""
 
     find_local_port_conflict() {
-        local port="$1" config key value
+        local port="$1" config key value candidate
         local -a configs=()
 
         PORT_CONFLICT_CONFIG=""
@@ -378,7 +378,7 @@ install_cn() {
         (( ${#configs[@]} > 0 )) || return 1
         for config in "${configs[@]}"; do
             [[ "$config" == "$MTCP_CONFIG" ]] && continue
-            for key in BUSINESS_PORT ANCHOR_PORT; do
+            for key in BUSINESS_PORT BUSINESS_PORTS ANCHOR_PORT; do
                 value="$(awk -v key="$key" '
                     index($0, key "=") == 1 {
                         value = substr($0, length(key) + 2)
@@ -387,14 +387,17 @@ install_cn() {
                         exit
                     }
                 ' "$config" 2>/dev/null || true)"
-                if valid_port "$value"; then
-                    value="$((10#$value))"
-                fi
-                if [[ "$value" == "$port" ]]; then
-                    PORT_CONFLICT_CONFIG="$config"
-                    PORT_CONFLICT_KEY="$key"
-                    return 0
-                fi
+                value="${value//,/ }"
+                for candidate in $value; do
+                    if valid_port "$candidate"; then
+                        candidate="$((10#$candidate))"
+                    fi
+                    if [[ "$candidate" == "$port" ]]; then
+                        PORT_CONFLICT_CONFIG="$config"
+                        PORT_CONFLICT_KEY="$key"
+                        return 0
+                    fi
+                done
             done
         done
         return 1
@@ -526,6 +529,7 @@ install_cn() {
                 values["DST"] = remote_ip
                 values["PORT"] = remote_port
                 values["BUSINESS_PORT"] = business_port
+                values["BUSINESS_PORTS"] = business_port
                 values["ANCHOR_HOST"] = "127.0.0.1"
                 values["ANCHOR_PORT"] = anchor_port
                 values["ACCEPT_RTT_MS"] = accept_rtt_ms
@@ -545,6 +549,10 @@ install_cn() {
                 print
             }
             END {
+                if (updated["BUSINESS_PORTS"] == 0) {
+                    print "BUSINESS_PORTS=\"" values["BUSINESS_PORTS"] "\""
+                    updated["BUSINESS_PORTS"] = 1
+                }
                 failed = 0
                 for (key in values) {
                     if (updated[key] != 1) {
@@ -823,6 +831,20 @@ install_remote() {
         SOCAT_BIN="$(command -v socat)"
     }
 
+    ensure_remote_inactive() {
+        local unit
+        local -a active_units=()
+        for unit in "$ANCHOR_UNIT" "$MAIN_UNIT"; do
+            systemctl is-active --quiet "$unit" >/dev/null 2>&1 && active_units+=("$unit")
+        done
+        if (( ${#active_units[@]} > 0 )); then
+            echo "Remote 端仍有运行中的 unit: ${active_units[*]}" >&2
+            echo "为避免运行进程与重装中的新配置错配，请先停止后重试：" >&2
+            echo "  systemctl stop $ANCHOR_UNIT $MAIN_UNIT" >&2
+            exit 1
+        fi
+    }
+
     cleanup_obsolete_project_units() {
         local unit_file target relative role_dir unit_name
         local -a unit_files=()
@@ -1052,6 +1074,7 @@ install_remote() {
 
     mkdir -p "$REMOTE_DIR"
     check_dependencies
+    ensure_remote_inactive
     cleanup_obsolete_project_units
     configure_listen_port
     download_gost

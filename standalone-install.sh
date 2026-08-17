@@ -12,10 +12,11 @@ set -euo pipefail
 #   bash standalone-install.sh cn
 #   bash standalone-install.sh relay
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 INSTALL_BASE="${INSTALL_BASE:-/opt/gost-mtcp}"
 GOST_VERSION="${GOST_VERSION:-v3.2.6}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 EMBEDDED_SOURCE=""
 PROMPT_FD=0
 PROMPT_FD_READY=0
@@ -36,7 +37,7 @@ trap cleanup EXIT
 show_banner() {
     cat <<'BANNER'
 ============================================================
-  9929-gost-mtcp 自包含安装器 v1.1.1
+  9929-gost-mtcp 自包含安装器 v1.2.0
 
   基于 GOST MTCP 的 ECMP 低延迟路径优选方案
 ============================================================
@@ -62,6 +63,7 @@ show_usage() {
   GITHUB_PROXY_PREFIX        GitHub 镜像前缀（CN 默认 https://ghfast.top/）
   CN_YAML_PATH               Relay 管理使用的 cn.yaml 路径（可选）
   CN_MTCP_CONFIG_PATH        Relay 管理使用的 mtcp.conf 路径（可选）
+  CN_INSTANCE                Relay 管理的线路别名；安装多条线路时必须指定
 
 示例：
   # Remote 端
@@ -251,46 +253,102 @@ download_gost() {
 
     echo "解压..."
     tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
-    install -m 755 "$tmp_dir/gost" "$dest_dir/gost"
+    local gost_tmp
+    gost_tmp="$(mktemp "$dest_dir/.gost.XXXXXX")"
+    CLEANUP_PATHS+=("$gost_tmp")
+    install -m 755 "$tmp_dir/gost" "$gost_tmp"
+    mv -f "$gost_tmp" "$dest_dir/gost"
     echo "✓ GOST 已安装到 $dest_dir/gost"
 }
 
+valid_ipv4() {
+    local value="$1" octet
+    local -a octets
+    IFS=. read -r -a octets <<< "$value"
+    (( ${#octets[@]} == 4 )) || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+ensure_units_inactive() {
+    local label="$1" unit
+    shift
+    local -a active=()
+    for unit in "$@"; do
+        "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1 && active+=("$unit")
+    done
+    if (( ${#active[@]} > 0 )); then
+        die "$label 仍在运行（${active[*]}）。为避免运行进程与新配置错配，请先停止这些 unit 后再重装"
+    fi
+}
+
+ensure_cn_port_available() {
+    local wanted="$1" current_config="$2" config values value
+    for config in "$INSTALL_BASE"/cn/instances/*/mtcp.conf "$INSTALL_BASE"/cn/mtcp.conf; do
+        [[ -f "$config" && "$config" != "$current_config" ]] || continue
+        values="$(awk -F= '
+            $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
+                value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
+            }
+        ' "$config")"
+        values="${values//,/ }"
+        for value in $values; do
+            [[ "$value" == "$wanted" ]] && die "本机端口 $wanted 已被另一条线路配置占用: $config"
+        done
+    done
+    if ss -ltnH "sport = :$wanted" 2>/dev/null | grep -q .; then
+        die "本机端口 $wanted 已被其他进程监听"
+    fi
+}
+
 install_remote() {
-    echo
-    echo "==> 开始安装 Remote 端"
-    echo
+    echo; echo "==> 开始安装 Remote 端"; echo
+    check_command curl; check_command tar; check_command "$SYSTEMCTL_BIN"; check_command socat
 
-    check_command curl
-    check_command tar
-    check_command systemctl
-    check_command socat
+    local remote_dir="$INSTALL_BASE/remote" main_unit="gost-mtcp-remote.service"
+    local anchor_unit="gost-mtcp-remote-anchor.service" mtcp_port socat_bin
+    local config_tmp main_tmp anchor_tmp
+    ensure_units_inactive "Remote" "$main_unit" "$anchor_unit"
+    mkdir -p "$remote_dir" "$SYSTEMD_DIR"
+    socat_bin="$(command -v socat)"
 
-    local remote_dir="$INSTALL_BASE/remote"
-    mkdir -p "$remote_dir"
-
-    local mtcp_port
     prompt_read mtcp_port "Remote MTCP 监听端口 [6600]: " || die "未输入 MTCP 端口"
     mtcp_port="${mtcp_port:-6600}"
-    [[ "$mtcp_port" =~ ^[0-9]+$ ]] && [[ "$mtcp_port" -ge 1 ]] && [[ "$mtcp_port" -le 65535 ]] || die "端口无效"
-    [[ "$mtcp_port" -eq 12346 ]] && die "12346 被 Anchor endpoint 占用"
+    valid_port "$mtcp_port" || die "端口无效"
+    mtcp_port=$((10#$mtcp_port))
+    [[ "$mtcp_port" != 12346 ]] || die "12346 被 Anchor endpoint 占用"
 
-    download_gost "remote" "$remote_dir"
+    download_gost remote "$remote_dir"
+    config_tmp="$(mktemp "$remote_dir/.remote.yaml.XXXXXX")"; CLEANUP_PATHS+=("$config_tmp")
+    extract_embedded REMOTE_YAML | awk -v addr=":$mtcp_port" '
+        /^[[:space:]]*-[[:space:]]name:[[:space:]]*mtcp-server[[:space:]]*$/ { target=1 }
+        target && /^[[:space:]]*addr:[[:space:]]*/ { sub(/addr:.*/, "addr: " addr); target=0; updated++ }
+        { print }
+        END { if (updated != 1) exit 42 }
+    ' > "$config_tmp" || die "canonical Remote 配置结构不符合预期"
+    chmod 0644 "$config_tmp"; mv -f "$config_tmp" "$remote_dir/remote.yaml"
 
-    echo "生成配置..."
-    extract_embedded "REMOTE_YAML" | sed "s/:6600/:$mtcp_port/" > "$remote_dir/remote.yaml"
+    main_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote.XXXXXX")"
+    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote-anchor.XXXXXX")"
+    CLEANUP_PATHS+=("$main_tmp" "$anchor_tmp")
+    extract_embedded REMOTE_MAIN_SERVICE | sed \
+        -e "s|/root/9929-gost-mtcp/remote|$remote_dir|g" \
+        > "$main_tmp"
+    extract_embedded REMOTE_ANCHOR_SERVICE | sed \
+        -e "s|9929-gost-mtcp-remote.service|$main_unit|g" \
+        -e "s|/usr/bin/socat|$socat_bin|g" \
+        > "$anchor_tmp"
+    chmod 0644 "$main_tmp" "$anchor_tmp"
+    mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit"
+    mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit"
 
-    echo "安装 systemd 服务..."
-    extract_embedded "REMOTE_MAIN_SERVICE" | sed "s|__INSTALL_BASE__|$INSTALL_BASE|g" \
-        > /etc/systemd/system/gost-mtcp-remote.service
-
-    extract_embedded "REMOTE_ANCHOR_SERVICE" | sed "s|__INSTALL_BASE__|$INSTALL_BASE|g" \
-        > /etc/systemd/system/gost-mtcp-remote-anchor.service
-
-    systemctl daemon-reload
-    systemctl enable --now gost-mtcp-remote.service
-    systemctl enable --now gost-mtcp-remote-anchor.service
-
-    sleep 2
+    "$SYSTEMCTL_BIN" daemon-reload
+    "$SYSTEMCTL_BIN" enable "$main_unit" "$anchor_unit"
+    "$SYSTEMCTL_BIN" restart "$main_unit" "$anchor_unit"
+    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" || die "$main_unit 启动失败"
+    "$SYSTEMCTL_BIN" is-active --quiet "$anchor_unit" || die "$anchor_unit 启动失败"
 
     cat <<DONE
 
@@ -299,149 +357,143 @@ install_remote() {
 ============================================================
 MTCP 监听端口: $mtcp_port
 配置文件: $remote_dir/remote.yaml
-
-检查服务状态:
-  systemctl status gost-mtcp-remote.service
-  systemctl status gost-mtcp-remote-anchor.service
-  ss -lntp | grep -E ':${mtcp_port}|:12346'
-
-记录以下信息用于 CN 端配置:
-  Remote 公网 IPv4: $(curl -s -4 -m 3 ifconfig.me 2>/dev/null || echo '<请手动确认>')
-  Remote MTCP 端口: $mtcp_port
-
-重要: 请在防火墙中只允许 CN 的公网 IP 访问端口 $mtcp_port
+服务: $main_unit, $anchor_unit
+重要: 请只允许 CN 公网 IP 访问 $mtcp_port/tcp
 ============================================================
 DONE
 }
 
 install_cn() {
-    echo
-    echo "==> 开始安装 CN 端"
-    echo
+    echo; echo "==> 开始安装 CN 端"; echo
+    check_command curl; check_command tar; check_command "$SYSTEMCTL_BIN"
+    check_command ss; check_command flock; check_command timeout
 
-    check_command curl
-    check_command tar
-    check_command systemctl
-    check_command ss
-    check_command flock
-    check_command timeout
+    local cn_dir="$INSTALL_BASE/cn" remote_alias remote_ip remote_port business_port anchor_port rtt_threshold
+    local unit_prefix main_unit anchor_unit watchdog_unit instance_dir state_dir
+    local yaml_tmp conf_tmp lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
+    mkdir -p "$cn_dir/instances"
 
-    local cn_dir="$INSTALL_BASE/cn"
-    mkdir -p "$cn_dir/state"
-
-    local remote_alias remote_ip remote_port business_port anchor_port rtt_threshold unit_prefix
-
-    echo "配置参数:"
-    echo
+    echo "配置参数:"; echo
     prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
     remote_alias="${remote_alias:-default}"
-    [[ "$remote_alias" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || remote_alias="default"
+    [[ "$remote_alias" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "线路别名无效"
+    case "$remote_alias" in anchor|watchdog|*-anchor|*-watchdog) die "线路别名使用了保留后缀" ;; esac
+
     unit_prefix="gost-mtcp"
-    [[ "$remote_alias" != "default" ]] && unit_prefix="gost-mtcp-${remote_alias}"
+    [[ "$remote_alias" != default ]] && unit_prefix="gost-mtcp-$remote_alias"
+    main_unit="$unit_prefix.service"; anchor_unit="$unit_prefix-anchor.service"
+    watchdog_unit="$unit_prefix-watchdog.service"
+    instance_dir="$cn_dir/instances/$remote_alias"; state_dir="$instance_dir/state"
+    ensure_units_inactive "CN 线路 $remote_alias" "$watchdog_unit" "$anchor_unit" "$main_unit"
+    mkdir -p "$state_dir" "$SYSTEMD_DIR"
 
     while :; do
         prompt_read remote_ip "Remote IPv4 地址: " || die "未输入 Remote IPv4 地址"
-        [[ "$remote_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+        valid_ipv4 "$remote_ip" && break
         echo "  无效的 IPv4 地址" >&2
     done
-
     prompt_read remote_port "Remote MTCP 端口 [6600]: " || die "未输入 Remote MTCP 端口"
-    remote_port="${remote_port:-6600}"
-
     prompt_read business_port "CN 业务监听端口 [12000]: " || die "未输入 CN 业务监听端口"
-    business_port="${business_port:-12000}"
-
     prompt_read anchor_port "CN Anchor 监听端口 [12001]: " || die "未输入 CN Anchor 监听端口"
-    anchor_port="${anchor_port:-12001}"
-
     prompt_read rtt_threshold "RTT 快路阈值（ms）[40]: " || die "未输入 RTT 阈值"
-    rtt_threshold="${rtt_threshold:-40}"
+    remote_port="${remote_port:-6600}"; business_port="${business_port:-12000}"
+    anchor_port="${anchor_port:-12001}"; rtt_threshold="${rtt_threshold:-40}"
+    valid_port "$remote_port" && valid_port "$business_port" && valid_port "$anchor_port" || die "端口必须为 1-65535"
+    remote_port=$((10#$remote_port)); business_port=$((10#$business_port)); anchor_port=$((10#$anchor_port))
+    [[ "$business_port" != "$anchor_port" ]] || die "业务端口不能与 Anchor 端口相同"
+    [[ "$rtt_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "RTT 阈值无效"
+    ensure_cn_port_available "$business_port" "$instance_dir/mtcp.conf"
+    ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf"
 
-    download_gost "cn" "$cn_dir"
+    download_gost cn "$cn_dir"
 
-    echo "生成配置文件..."
-    extract_embedded "CN_YAML" | \
-        sed "s/:12000/:$business_port/" | \
-        sed "s/127.0.0.1:12001/127.0.0.1:$anchor_port/" | \
-        sed "s/remote.example.invalid:6600/$remote_ip:$remote_port/" \
-        > "$cn_dir/cn.yaml"
+    yaml_tmp="$(mktemp "$instance_dir/.cn.yaml.XXXXXX")"
+    conf_tmp="$(mktemp "$instance_dir/.mtcp.conf.XXXXXX")"
+    CLEANUP_PATHS+=("$yaml_tmp" "$conf_tmp")
+    extract_embedded CN_YAML | awk -v business=":$business_port" \
+        -v anchor="127.0.0.1:$anchor_port" -v remote="$remote_ip:$remote_port" '
+        /^[[:space:]]*-[[:space:]]name:[[:space:]]*tcp-entry[[:space:]]*$/ { target="business" }
+        /^[[:space:]]*-[[:space:]]name:[[:space:]]*mtcp-anchor[[:space:]]*$/ { target="anchor" }
+        /^chains:[[:space:]]*$/ { chains=1 }
+        chains && /^[[:space:]]*addr:[[:space:]]*/ { sub(/addr:.*/, "addr: " remote); chains=0; r++ }
+        target != "" && /^[[:space:]]*addr:[[:space:]]*/ {
+            value=(target == "business" ? business : anchor); sub(/addr:.*/, "addr: " value)
+            if (target == "business") b++; else a++; target=""
+        }
+        { print }
+        END { if (a != 1 || b != 1 || r != 1) exit 42 }
+    ' > "$yaml_tmp" || die "canonical CN YAML 结构不符合预期"
 
-    local state_dir="$cn_dir/state"
-    extract_embedded "CN_MTCP_CONF" | \
-        sed "s/__MAIN_UNIT__/${unit_prefix}.service/g" | \
-        sed "s/__ANCHOR_UNIT__/${unit_prefix}-anchor.service/g" | \
-        sed "s/__REMOTE_IP__/$remote_ip/g" | \
-        sed "s/__REMOTE_PORT__/$remote_port/g" | \
-        sed "s/__BUSINESS_PORT__/$business_port/g" | \
-        sed "s/__ANCHOR_PORT__/$anchor_port/g" | \
-        sed "s/__RTT_THRESHOLD__/$rtt_threshold/g" | \
-        sed "s|__STATE_DIR__|$state_dir|g" \
-        > "$cn_dir/mtcp.conf"
+    extract_embedded CN_MTCP_CONF | awk -v main="$main_unit" -v anchor_unit="$anchor_unit" \
+        -v remote="$remote_ip" -v remote_port="$remote_port" -v business="$business_port" \
+        -v anchor_port="$anchor_port" -v rtt="$rtt_threshold" -v state="$state_dir" '
+        BEGIN {
+            v["UNIT"]=main; v["ANCHOR_UNIT"]=anchor_unit; v["DST"]=remote; v["PORT"]=remote_port
+            v["BUSINESS_PORT"]=business; v["BUSINESS_PORTS"]=business; v["ANCHOR_HOST"]="127.0.0.1"
+            v["ANCHOR_PORT"]=anchor_port; v["ACCEPT_RTT_MS"]=rtt; v["STATE_DIR"]=state
+            v["STATE_FILE"]=state "/runtime.state"; v["STATUS_JSON"]=state "/status.json"
+            v["EVENT_FILE"]=state "/events.jsonl"
+        }
+        { key=$0; sub(/=.*/, "", key); if (key in v) { print key "=\"" v[key] "\""; seen[key]++; next } print }
+        END { for (key in v) if (seen[key] != 1) exit 42 }
+    ' > "$conf_tmp" || die "canonical CN 配置结构不符合预期"
+    chmod 0644 "$yaml_tmp" "$conf_tmp"
+    mv -f "$yaml_tmp" "$instance_dir/cn.yaml"; mv -f "$conf_tmp" "$instance_dir/mtcp.conf"
 
-    echo "安装运行脚本..."
-    extract_embedded "CN_LIB" > "$cn_dir/mtcp-lib.sh"
-    extract_embedded "CN_PREWARM" > "$cn_dir/mtcp-prewarm.sh"
-    extract_embedded "CN_WATCHDOG" > "$cn_dir/mtcp-watchdog.sh"
-    chmod +x "$cn_dir"/*.sh
+    lib_tmp="$(mktemp "$cn_dir/.mtcp-lib.XXXXXX")"
+    prewarm_tmp="$(mktemp "$cn_dir/.mtcp-prewarm.XXXXXX")"
+    watchdog_tmp="$(mktemp "$cn_dir/.mtcp-watchdog.XXXXXX")"
+    CLEANUP_PATHS+=("$lib_tmp" "$prewarm_tmp" "$watchdog_tmp")
+    extract_embedded CN_LIB | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$lib_tmp"
+    extract_embedded CN_PREWARM | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$prewarm_tmp"
+    extract_embedded CN_WATCHDOG | sed "s|/root/9929-gost-mtcp/cn|$cn_dir|g" > "$watchdog_tmp"
+    chmod 0755 "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp"
+    mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh"; mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh"
+    mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh"
 
-    # 修正脚本中的硬编码路径
-    sed -i "s|/opt/gost-mtcp|$INSTALL_BASE|g" "$cn_dir"/*.sh
+    main_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}.XXXXXX")"
+    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}-anchor.XXXXXX")"
+    watchdog_unit_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}-watchdog.XXXXXX")"
+    CLEANUP_PATHS+=("$main_tmp" "$anchor_tmp" "$watchdog_unit_tmp")
+    extract_embedded CN_MAIN_SERVICE | awk -v cn="$cn_dir" -v wd="$instance_dir" -v yaml="$instance_dir/cn.yaml" '
+        /^WorkingDirectory=/ { print "WorkingDirectory=" wd; next }
+        /^ExecStartPre=\/usr\/bin\/test -x / { print "ExecStartPre=/usr/bin/test -x " cn "/gost"; next }
+        /^ExecStartPre=\/usr\/bin\/test -r / { print "ExecStartPre=/usr/bin/test -r " yaml; next }
+        /^ExecStart=/ { print "ExecStart=" cn "/gost -D -C " yaml; next }
+        { print }
+    ' > "$main_tmp"
+    extract_embedded CN_ANCHOR_SERVICE | sed \
+        -e "s|9929-gost-mtcp.service|$main_unit|g" \
+        -e "s|/dev/tcp/127.0.0.1/12001|/dev/tcp/127.0.0.1/$anchor_port|g" > "$anchor_tmp"
+    extract_embedded CN_WATCHDOG_SERVICE | awk -v canonical="9929-gost-mtcp.service" -v main="$main_unit" \
+        -v root="/root/9929-gost-mtcp/cn" -v cn="$cn_dir" -v wd="$instance_dir" \
+        -v config="$instance_dir/mtcp.conf" '
+        function repl(s,a,b) { while ((p=index(s,a))>0) s=substr(s,1,p-1) b substr(s,p+length(a)); return s }
+        { line=repl($0,canonical,main); line=repl(line,root "/mtcp.conf",config); line=repl(line,root,cn)
+          if (line ~ /^WorkingDirectory=/) line="WorkingDirectory=" wd; print line }
+    ' > "$watchdog_unit_tmp"
+    chmod 0644 "$main_tmp" "$anchor_tmp" "$watchdog_unit_tmp"
+    mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit"
+    mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit"
+    mv -f "$watchdog_unit_tmp" "$SYSTEMD_DIR/$watchdog_unit"
 
-    echo "安装 systemd 服务..."
-
-    extract_embedded "CN_MAIN_SERVICE" | \
-        sed "s|__INSTALL_BASE__|$INSTALL_BASE|g" | \
-        sed "s/__UNIT_PREFIX__/$unit_prefix/g" \
-        > "/etc/systemd/system/${unit_prefix}.service"
-
-    extract_embedded "CN_ANCHOR_SERVICE" | \
-        sed "s|__INSTALL_BASE__|$INSTALL_BASE|g" | \
-        sed "s/__UNIT_PREFIX__/$unit_prefix/g" | \
-        sed "s/127.0.0.1:12001/127.0.0.1:$anchor_port/" \
-        > "/etc/systemd/system/${unit_prefix}-anchor.service"
-
-    extract_embedded "CN_WATCHDOG_SERVICE" | \
-        sed "s|__INSTALL_BASE__|$INSTALL_BASE|g" | \
-        sed "s/__UNIT_PREFIX__/$unit_prefix/g" \
-        > "/etc/systemd/system/${unit_prefix}-watchdog.service"
-
-    systemctl daemon-reload
-    systemctl enable --now "${unit_prefix}.service"
-    systemctl enable --now "${unit_prefix}-watchdog.service"
-
-    sleep 3
+    "$SYSTEMCTL_BIN" daemon-reload
+    "$SYSTEMCTL_BIN" enable "$main_unit" "$watchdog_unit"
+    "$SYSTEMCTL_BIN" restart "$main_unit" "$watchdog_unit"
+    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" || die "$main_unit 启动失败"
+    "$SYSTEMCTL_BIN" is-active --quiet "$watchdog_unit" || die "$watchdog_unit 启动失败"
 
     cat <<DONE
 
 ============================================================
   CN 端安装完成
 ============================================================
-线路: $remote_alias
-Remote: $remote_ip:$remote_port
-业务端口: $business_port (TCP)
-RTT 阈值: ${rtt_threshold}ms
-
-配置文件:
-  $cn_dir/cn.yaml
-  $cn_dir/mtcp.conf
-
-检查服务:
-  systemctl status ${unit_prefix}.service
-  systemctl status ${unit_prefix}-watchdog.service
-
-查看状态:
-  cat $state_dir/status.json
-  tail -f $state_dir/events.jsonl
-
-查看 outer 连接:
-  ss -tin state established 'dst $remote_ip dport = :$remote_port'
-
-修改后端地址:
-  编辑 $cn_dir/cn.yaml 中的 forwarder.nodes[0].addr
-  然后执行: systemctl restart ${unit_prefix}.service
-
-管理额外端口 Relay:
-  bash standalone-install.sh relay
+线路: $remote_alias    Remote: $remote_ip:$remote_port
+业务端口: $business_port    RTT 阈值: ${rtt_threshold}ms
+配置: $instance_dir/cn.yaml, $instance_dir/mtcp.conf
+状态: $state_dir/status.json
+服务: $main_unit, $watchdog_unit
+Relay 管理: CN_INSTANCE=$remote_alias bash standalone-install.sh relay
 ============================================================
 DONE
 }
@@ -514,17 +566,32 @@ cn_relay_rows() {
 resolve_cn_relay_context() {
     if [[ -n "${CN_YAML_PATH:-}" ]]; then
         CN_RELAY_YAML="$CN_YAML_PATH"
+    elif [[ -n "${CN_INSTANCE:-}" ]]; then
+        [[ "$CN_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "CN_INSTANCE 无效"
+        CN_RELAY_YAML="$INSTALL_BASE/cn/instances/$CN_INSTANCE/cn.yaml"
     elif [[ -r "$INSTALL_BASE/cn/cn.yaml" ]]; then
+        # 兼容 v1.1 及更早的单目录安装。
         CN_RELAY_YAML="$INSTALL_BASE/cn/cn.yaml"
     else
-        CN_RELAY_YAML="$INSTALL_BASE/cn.yaml"
+        local path
+        local -a candidates=()
+        for path in "$INSTALL_BASE"/cn/instances/*/cn.yaml; do
+            [[ -r "$path" ]] && candidates+=("$path")
+        done
+        if (( ${#candidates[@]} == 1 )); then
+            CN_RELAY_YAML="${candidates[0]}"
+        elif (( ${#candidates[@]} > 1 )); then
+            echo "检测到多条 CN 线路：" >&2
+            for path in "${candidates[@]}"; do echo "  $(basename "$(dirname "$path")")" >&2; done
+            die "请用 CN_INSTANCE=<线路别名> 指定 Relay 管理目标"
+        else
+            CN_RELAY_YAML="$INSTALL_BASE/cn.yaml"
+        fi
     fi
     if [[ -n "${CN_MTCP_CONFIG_PATH:-}" ]]; then
         CN_RELAY_CONFIG="$CN_MTCP_CONFIG_PATH"
-    elif [[ -r "$INSTALL_BASE/cn/mtcp.conf" ]]; then
-        CN_RELAY_CONFIG="$INSTALL_BASE/cn/mtcp.conf"
     else
-        CN_RELAY_CONFIG="$INSTALL_BASE/mtcp.conf"
+        CN_RELAY_CONFIG="$(dirname "$CN_RELAY_YAML")/mtcp.conf"
     fi
     CN_RELAY_DIR="$(dirname "$CN_RELAY_YAML")"
     [[ -r "$CN_RELAY_YAML" ]] || die "CN 配置不存在: $CN_RELAY_YAML"
@@ -539,6 +606,20 @@ resolve_cn_relay_context() {
     valid_port "$CN_ANCHOR_PORT" || die "mtcp.conf 中 ANCHOR_PORT 无效"
     "$SYSTEMCTL_BIN" cat "$CN_RELAY_UNIT" >/dev/null 2>&1 || \
         die "systemd unit 不存在: ${CN_RELAY_UNIT}（请先修正 mtcp.conf 的 UNIT）"
+}
+
+cn_business_ports() {
+    local yaml="$1" name listen backend chain port ports="" seen=" "
+    while IFS=$'\t' read -r name listen backend chain; do
+        [[ "$name" != "mtcp-anchor" && "$chain" == "chain-mtcp" ]] || continue
+        [[ "$listen" =~ ^:([0-9]+)$ ]] || continue
+        port="${BASH_REMATCH[1]}"
+        valid_port "$port" || continue
+        if [[ "$seen" != *" $port "* ]]; then
+            ports="${ports:+$ports }$port"; seen+="$port "
+        fi
+    done < <(cn_relay_rows "$yaml")
+    printf '%s\n' "$ports"
 }
 
 list_cn_relays() {
@@ -596,18 +677,46 @@ validate_cn_relay_yaml() {
 }
 
 apply_cn_relay_yaml() {
-    local candidate="$1" action="$2" backup failed stamp restart_ok=0
+    local candidate="$1" action="$2" backup failed config_backup config_failed
+    local config_candidate ports stamp restart_ok=0
     if ! validate_cn_relay_yaml "$candidate"; then
         rm -f "$candidate"
         die "生成的 cn.yaml 未通过结构检查，原配置未修改"
     fi
 
+    ports="$(cn_business_ports "$candidate")"
+    [[ " $ports " == *" $CN_PRIMARY_PORT "* ]] || {
+        rm -f "$candidate"
+        die "生成的 BUSINESS_PORTS 未包含主业务端口，原配置未修改"
+    }
+    [[ " $ports " != *" $CN_ANCHOR_PORT "* ]] || {
+        rm -f "$candidate"
+        die "生成的 BUSINESS_PORTS 错误包含 Anchor 端口，原配置未修改"
+    }
+    config_candidate="$(mktemp "$CN_RELAY_DIR/.mtcp.conf.relay.XXXXXX")"
+    if ! awk -v ports="$ports" '
+        /^BUSINESS_PORTS=/ { print "BUSINESS_PORTS=\"" ports "\""; updated=1; next }
+        { print }
+        END { if (!updated) print "BUSINESS_PORTS=\"" ports "\"" }
+    ' "$CN_RELAY_CONFIG" > "$config_candidate"; then
+        rm -f "$candidate" "$config_candidate"
+        die "无法生成 BUSINESS_PORTS 配置，原配置未修改"
+    fi
+
     stamp="$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
     backup="${CN_RELAY_YAML}.bak.$stamp"
     failed="${CN_RELAY_YAML}.failed.$stamp"
+    config_backup="${CN_RELAY_CONFIG}.bak.$stamp"
+    config_failed="${CN_RELAY_CONFIG}.failed.$stamp"
     cp -p "$CN_RELAY_YAML" "$backup"
-    chmod 0644 "$candidate"
-    mv -f "$candidate" "$CN_RELAY_YAML"
+    cp -p "$CN_RELAY_CONFIG" "$config_backup"
+    chmod 0644 "$candidate" "$config_candidate"
+    if ! mv -f "$candidate" "$CN_RELAY_YAML" || ! mv -f "$config_candidate" "$CN_RELAY_CONFIG"; then
+        cp -p "$backup" "$CN_RELAY_YAML" >/dev/null 2>&1 || true
+        cp -p "$config_backup" "$CN_RELAY_CONFIG" >/dev/null 2>&1 || true
+        rm -f "$candidate" "$config_candidate"
+        die "无法同时替换 cn.yaml 与 mtcp.conf；已尝试恢复原配置"
+    fi
 
     echo "正在重启 ${CN_RELAY_UNIT}；现有业务连接会中断并由 Watchdog 重新 Prewarm。"
     if "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT"; then
@@ -619,15 +728,18 @@ apply_cn_relay_yaml() {
 
     if (( restart_ok == 1 )); then
         echo "✓ $action"
-        echo "备份: $backup"
+        echo "Watchdog BUSINESS_PORTS 已同步为: $ports"
+        echo "备份: $backup, $config_backup"
         return 0
     fi
 
     echo "GOST 重启失败，正在回滚 $CN_RELAY_YAML" >&2
     cp -p "$CN_RELAY_YAML" "$failed"
+    cp -p "$CN_RELAY_CONFIG" "$config_failed"
     cp -p "$backup" "$CN_RELAY_YAML"
+    cp -p "$config_backup" "$CN_RELAY_CONFIG"
     "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT" >/dev/null 2>&1 || true
-    die "Relay 修改未生效；已恢复原配置。失败配置保存在: $failed"
+    die "Relay 修改未生效；YAML 与 mtcp.conf 均已回滚。失败配置: $failed, $config_failed"
 }
 
 add_cn_relay() {
@@ -838,8 +950,9 @@ main "$@"
 exit $?
 
 # ============================================================
-# 嵌入文件内容
+# 以下内容由 scripts/generate-standalone.sh 从 cn/ 与 remote/ 生成。
 # ============================================================
+# === GENERATED EMBEDDED FILES: DO NOT EDIT ===
 
 ### BEGIN REMOTE_YAML ###
 services:
@@ -857,28 +970,38 @@ services:
       mux.maxFrameSize: 32768
       mux.maxReceiveBuffer: 33554432
       mux.maxStreamBuffer: 4194304
+
 ### END REMOTE_YAML ###
 
 ### BEGIN REMOTE_MAIN_SERVICE ###
 [Unit]
-Description=GOST MTCP Remote Relay
+Description=9929 GOST MTCP v1 Remote Server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=__INSTALL_BASE__/remote/gost -D -C __INSTALL_BASE__/remote/remote.yaml
+WorkingDirectory=/root/9929-gost-mtcp/remote
+ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/remote/gost
+ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/remote/remote.yaml
+ExecStart=/root/9929-gost-mtcp/remote/gost -D -C /root/9929-gost-mtcp/remote/remote.yaml
 Restart=always
-RestartSec=5
-KillMode=process
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+
 ### END REMOTE_MAIN_SERVICE ###
 
 ### BEGIN REMOTE_ANCHOR_SERVICE ###
 [Unit]
-Description=GOST MTCP Remote Anchor Endpoint
+Description=9929 GOST MTCP v1 Remote Anchor Endpoint
 After=network-online.target
 Wants=network-online.target
 
@@ -890,6 +1013,7 @@ RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
+
 ### END REMOTE_ANCHOR_SERVICE ###
 
 ### BEGIN CN_YAML ###
@@ -906,6 +1030,8 @@ services:
     - name: backend
       addr: 127.0.0.1:2345
 
+# 专用 MTCP 锚定入口，仅监听本机。
+# Anchor 会主动发送 1 Byte 触发默认 Relay 首包逻辑，因此共享 connector 保持原始默认行为。
 - name: mtcp-anchor
   addr: 127.0.0.1:12001
   handler:
@@ -937,120 +1063,179 @@ chains:
           mux.maxFrameSize: 32768
           mux.maxReceiveBuffer: 33554432
           mux.maxStreamBuffer: 4194304
+
 ### END CN_YAML ###
 
 ### BEGIN CN_MTCP_CONF ###
-UNIT=__MAIN_UNIT__
-ANCHOR_UNIT=__ANCHOR_UNIT__
-DST=__REMOTE_IP__
-PORT=__REMOTE_PORT__
-BUSINESS_PORT=__BUSINESS_PORT__
-ANCHOR_HOST=127.0.0.1
-ANCHOR_PORT=__ANCHOR_PORT__
-ACCEPT_RTT_MS=__RTT_THRESHOLD__
+# GOST MTCP Remote v1 configuration
+# watchdog 每轮重新 source，本文件中的阈值修改后无需重启 watchdog。
 
-LIVE_RTT_WARN_MS=120
-LIVE_RTT_CRIT_MS=250
-LIVE_RTT_WARN_HOLD_SEC=30
-LIVE_RTT_CRIT_HOLD_SEC=120
-LIVE_RTT_RECOVER_MS=80
-LIVE_RTT_RECOVER_HOLD_SEC=30
+# ---- systemd / path ----
+UNIT="9929-gost-mtcp.service"
+ANCHOR_UNIT="9929-gost-mtcp-anchor.service"
+DST="remote.example.invalid"
+PORT="6600"
+BUSINESS_PORT="12000"
+# 以空格或逗号分隔。BUSINESS_PORT 是主入口，必须包含在本列表中。
+BUSINESS_PORTS="12000"
+ANCHOR_HOST="127.0.0.1"
+ANCHOR_PORT="12001"
 
-PREWARM_MAX_DRAWS=12
-RECOVERY_PREWARM_DRAWS=8
-DEGRADED_RETRY_DRAWS=4
-PREWARM_NO_SESSION_ATTEMPTS=3
-PREWARM_CONNECT_WAIT_SEC=2
-PREWARM_STABLE_REQUIRED=2
-PREWARM_STABLE_INTERVAL_SEC=1
-PREWARM_KILL_WAIT_SEC=3
-PREWARM_TOTAL_TIMEOUT_SEC=120
+# ---- ECMP 新 session 准入 ----
+ACCEPT_RTT_MS="40"
 
-ANCHOR_START_TIMEOUT_SEC=10
-ANCHOR_STABLE_REQUIRED=2
-ANCHOR_STABLE_INTERVAL_SEC=2
-ANCHOR_RETRY_SEC=60
-DEGRADED_RETRY_SEC=900
-DEGRADED_BUSY_DEFER_SEC=180
+# ---- 运行中 RTT 监控：只告警，不因当前 RTT 高主动 kill ----
+LIVE_RTT_WARN_MS="120"
+LIVE_RTT_CRIT_MS="250"
+LIVE_RTT_WARN_HOLD_SEC="30"
+LIVE_RTT_CRIT_HOLD_SEC="120"
+LIVE_RTT_RECOVER_MS="80"
+LIVE_RTT_RECOVER_HOLD_SEC="30"
 
-WATCH_INTERVAL_SEC=5
-ZERO_GRACE_SEC=10
-REMOTE_PROBE_INTERVAL_SEC=15
-REMOTE_PROBE_TIMEOUT_SEC=5
-REMOTE_PROBE_ATTEMPTS=2
-DATA_PROBE_ENABLED=yes
-DATA_PROBE_INTERVAL_SEC=15
-DATA_PROBE_TIMEOUT_SEC=3
-DATA_PROBE_FAIL_THRESHOLD=3
-DOWN_RETRY_SEC=15
-STUCK_RESTART_AFTER_SEC=1800
-RESTART_COOLDOWN_SEC=60
-MULTI_CONFIRM_COUNT=3
+# ---- prewarm / 抽卡 ----
+PREWARM_MAX_DRAWS="12"
+RECOVERY_PREWARM_DRAWS="8"
+DEGRADED_RETRY_DRAWS="4"
+PREWARM_NO_SESSION_ATTEMPTS="5"
+PREWARM_CONNECT_WAIT_SEC="2"
+PREWARM_STABLE_REQUIRED="2"
+PREWARM_STABLE_INTERVAL_SEC="1"
+PREWARM_KILL_WAIT_SEC="2"
+PREWARM_TOTAL_TIMEOUT_SEC="120"
 
-STATE_DIR=__STATE_DIR__
-RETENTION_SEC=86400
+# ---- Anchor ----
+# Anchor 本身就是候选 session 的建立者和最终锚定者：
+# start Anchor -> 主动发 1 Byte -> 建立 outer -> 检测 minrtt -> 慢则 stop+kill -> 重抽；快则直接留下。
+ANCHOR_START_TIMEOUT_SEC="8"
+ANCHOR_STABLE_REQUIRED="2"
+ANCHOR_STABLE_INTERVAL_SEC="1"
+ANCHOR_RETRY_SEC="60"
+
+# ---- DEGRADED(PATH) 自动恢复 ----
+DEGRADED_RETRY_SEC="900"
+DEGRADED_BUSY_DEFER_SEC="60"
+BUSINESS_IDLE_HOLD_SEC="15"
+
+# ---- watchdog / recovery ----
+WATCH_INTERVAL_SEC="5"
+ZERO_GRACE_SEC="5"
+REMOTE_PROBE_INTERVAL_SEC="15"
+REMOTE_PROBE_TIMEOUT_SEC="2"
+REMOTE_PROBE_ATTEMPTS="2"
+# 通过本地 Anchor 入口发送并收回 1 Byte，验证当前 MTCP outer 的真实双向数据面。
+DATA_PROBE_ENABLED="yes"
+DATA_PROBE_INTERVAL_SEC="15"
+DATA_PROBE_TIMEOUT_SEC="3"
+DATA_PROBE_FAIL_THRESHOLD="3"
+# 10 分钟内最多允许 3 次 stale-outer 重启；达到上限后熔断 10 分钟。
+DATA_PROBE_RESTART_WINDOW_SEC="600"
+DATA_PROBE_RESTART_MAX="3"
+DATA_PROBE_BREAKER_OPEN_SEC="600"
+DOWN_RETRY_SEC="15"
+STUCK_RESTART_AFTER_SEC="60"
+RESTART_COOLDOWN_SEC="60"
+MULTI_CONFIRM_COUNT="2"
+# GOST 因 systemd StartLimit 等原因停止时，低频尝试 reset-failed + restart。
+PROCESS_RECOVERY_GRACE_SEC="10"
+PROCESS_RECOVERY_INTERVAL_SEC="60"
+PROCESS_RECOVERY_WINDOW_SEC="600"
+PROCESS_RECOVERY_MAX="3"
+PROCESS_BREAKER_OPEN_SEC="600"
+
+# ---- state / retention ----
+STATE_DIR="/root/9929-gost-mtcp/cn/state"
+STATE_FILE="/root/9929-gost-mtcp/cn/state/runtime.state"
+STATUS_JSON="/root/9929-gost-mtcp/cn/state/status.json"
+EVENT_FILE="/root/9929-gost-mtcp/cn/state/events.jsonl"
+RETENTION_SEC="86400"
+
 ### END CN_MTCP_CONF ###
 
 ### BEGIN CN_MAIN_SERVICE ###
 [Unit]
-Description=GOST MTCP CN Main Service
+Description=9929 GOST MTCP v1 Data Plane
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=__INSTALL_BASE__/cn/gost -D -C __INSTALL_BASE__/cn/cn.yaml
+WorkingDirectory=/root/9929-gost-mtcp/cn
+ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/cn/gost
+ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/cn/cn.yaml
+ExecStart=/root/9929-gost-mtcp/cn/gost -D -C /root/9929-gost-mtcp/cn/cn.yaml
 Restart=always
-RestartSec=5
-KillMode=process
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+
 ### END CN_MAIN_SERVICE ###
 
 ### BEGIN CN_ANCHOR_SERVICE ###
 [Unit]
-Description=GOST MTCP CN Anchor
-After=network-online.target
-Wants=network-online.target
+Description=9929 GOST MTCP v1 Anchor Stream
+After=9929-gost-mtcp.service
+Requires=9929-gost-mtcp.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+WorkingDirectory=/
+# 默认 Relay 不改 nodelay。Anchor 主动发送 1 Byte，随后持续读取，长期占住一个 logical stream。
 ExecStart=/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/12001; printf "A" >&3; exec cat <&3 >/dev/null'
-Restart=no
-KillMode=process
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
 
-[Install]
-WantedBy=multi-user.target
+# 故意没有 [Install]：不要 enable。
+# 只允许 prewarm/watchdog 控制，以免开机时抢先锚定未经优选的 outer。
+
 ### END CN_ANCHOR_SERVICE ###
 
 ### BEGIN CN_WATCHDOG_SERVICE ###
 [Unit]
-Description=GOST MTCP CN Watchdog
-After=network-online.target __UNIT_PREFIX__.service
-Wants=network-online.target
-BindsTo=__UNIT_PREFIX__.service
+Description=9929 GOST MTCP v1 Watchdog
+After=network-online.target 9929-gost-mtcp.service
+Wants=network-online.target 9929-gost-mtcp.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
-Environment=MTCP_LIB=__INSTALL_BASE__/cn/mtcp-lib.sh
-Environment=MTCP_PREWARM=__INSTALL_BASE__/cn/mtcp-prewarm.sh
-ExecStart=__INSTALL_BASE__/cn/mtcp-watchdog.sh __INSTALL_BASE__/cn/mtcp.conf
+WorkingDirectory=/root/9929-gost-mtcp/cn
+Environment="MTCP_LIB=/root/9929-gost-mtcp/cn/mtcp-lib.sh"
+Environment="MTCP_PREWARM=/root/9929-gost-mtcp/cn/mtcp-prewarm.sh"
+ExecStartPre=/usr/bin/test -r /root/9929-gost-mtcp/cn/mtcp.conf
+ExecStartPre=/usr/bin/test -x /root/9929-gost-mtcp/cn/mtcp-watchdog.sh
+ExecStart=/root/9929-gost-mtcp/cn/mtcp-watchdog.sh /root/9929-gost-mtcp/cn/mtcp.conf
 Restart=always
-RestartSec=10
-KillMode=process
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+
 ### END CN_WATCHDOG_SERVICE ###
 
 ### BEGIN CN_LIB ###
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG_DEFAULT="/opt/gost-mtcp/cn/mtcp.conf"
+CONFIG_DEFAULT="/root/9929-gost-mtcp/cn/mtcp.conf"
 CONFIG_KEYS=(
-    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT
+    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
     LIVE_RTT_WARN_MS LIVE_RTT_CRIT_MS LIVE_RTT_WARN_HOLD_SEC
     LIVE_RTT_CRIT_HOLD_SEC LIVE_RTT_RECOVER_MS LIVE_RTT_RECOVER_HOLD_SEC
@@ -1058,21 +1243,27 @@ CONFIG_KEYS=(
     PREWARM_NO_SESSION_ATTEMPTS PREWARM_CONNECT_WAIT_SEC PREWARM_STABLE_REQUIRED
     PREWARM_STABLE_INTERVAL_SEC PREWARM_KILL_WAIT_SEC PREWARM_TOTAL_TIMEOUT_SEC
     ANCHOR_START_TIMEOUT_SEC ANCHOR_STABLE_REQUIRED ANCHOR_STABLE_INTERVAL_SEC
-    ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC
+    ANCHOR_RETRY_SEC DEGRADED_RETRY_SEC DEGRADED_BUSY_DEFER_SEC BUSINESS_IDLE_HOLD_SEC
     WATCH_INTERVAL_SEC ZERO_GRACE_SEC REMOTE_PROBE_INTERVAL_SEC
     REMOTE_PROBE_TIMEOUT_SEC REMOTE_PROBE_ATTEMPTS DOWN_RETRY_SEC
     DATA_PROBE_ENABLED DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC
-    DATA_PROBE_FAIL_THRESHOLD
+    DATA_PROBE_FAIL_THRESHOLD DATA_PROBE_RESTART_WINDOW_SEC DATA_PROBE_RESTART_MAX
+    DATA_PROBE_BREAKER_OPEN_SEC
     STUCK_RESTART_AFTER_SEC RESTART_COOLDOWN_SEC MULTI_CONFIRM_COUNT
+    PROCESS_RECOVERY_GRACE_SEC PROCESS_RECOVERY_INTERVAL_SEC PROCESS_RECOVERY_WINDOW_SEC PROCESS_RECOVERY_MAX
+    PROCESS_BREAKER_OPEN_SEC
     STATE_DIR STATE_FILE STATUS_JSON EVENT_FILE RETENTION_SEC
 )
 
 load_config() {
     local cfg="${1:-$CONFIG_DEFAULT}"
     [[ -r "$cfg" ]] || { echo "config not readable: $cfg" >&2; return 1; }
+
+    # watchdog 会重复加载配置；先清空已知键，避免删除配置项后继续沿用旧值。
     unset "${CONFIG_KEYS[@]}"
     # shellcheck disable=SC1090
     source "$cfg" || { echo "config invalid: $cfg" >&2; return 1; }
+
     local required
     for required in UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT ACCEPT_RTT_MS; do
         if [[ -z "${!required:-}" ]]; then
@@ -1080,21 +1271,59 @@ load_config() {
             return 1
         fi
     done
-    STATE_DIR="${STATE_DIR:-/opt/gost-mtcp/cn/state}"
+
+    STATE_DIR="${STATE_DIR:-/root/9929-gost-mtcp/cn/state}"
     STATE_FILE="${STATE_FILE:-${STATE_DIR}/runtime.state}"
     STATUS_JSON="${STATUS_JSON:-${STATE_DIR}/status.json}"
     EVENT_FILE="${EVENT_FILE:-${STATE_DIR}/events.jsonl}"
     RETENTION_SEC="${RETENTION_SEC:-86400}"
+
+    BUSINESS_PORTS="${BUSINESS_PORTS:-$BUSINESS_PORT}"
+    BUSINESS_PORTS="${BUSINESS_PORTS//,/ }"
+    local port seen=" " normalized="" found_primary=no
+    for port in $BUSINESS_PORTS; do
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            echo "invalid port in BUSINESS_PORTS: $port" >&2
+            return 1
+        fi
+        [[ "$port" == "$ANCHOR_PORT" ]] && {
+            echo "BUSINESS_PORTS must not contain ANCHOR_PORT: $port" >&2
+            return 1
+        }
+        [[ "$port" == "$BUSINESS_PORT" ]] && found_primary=yes
+        if [[ "$seen" != *" $port "* ]]; then
+            normalized="${normalized:+$normalized }$port"
+            seen+="$port "
+        fi
+    done
+    [[ -n "$normalized" && "$found_primary" == yes ]] || {
+        echo "BUSINESS_PORTS must include BUSINESS_PORT ($BUSINESS_PORT)" >&2
+        return 1
+    }
+    BUSINESS_PORTS="$normalized"
+
     DATA_PROBE_ENABLED="${DATA_PROBE_ENABLED:-yes}"
     DATA_PROBE_INTERVAL_SEC="${DATA_PROBE_INTERVAL_SEC:-15}"
     DATA_PROBE_TIMEOUT_SEC="${DATA_PROBE_TIMEOUT_SEC:-3}"
     DATA_PROBE_FAIL_THRESHOLD="${DATA_PROBE_FAIL_THRESHOLD:-3}"
+    DATA_PROBE_RESTART_WINDOW_SEC="${DATA_PROBE_RESTART_WINDOW_SEC:-600}"
+    DATA_PROBE_RESTART_MAX="${DATA_PROBE_RESTART_MAX:-3}"
+    DATA_PROBE_BREAKER_OPEN_SEC="${DATA_PROBE_BREAKER_OPEN_SEC:-600}"
+    BUSINESS_IDLE_HOLD_SEC="${BUSINESS_IDLE_HOLD_SEC:-15}"
+    PROCESS_RECOVERY_GRACE_SEC="${PROCESS_RECOVERY_GRACE_SEC:-10}"
+    PROCESS_RECOVERY_INTERVAL_SEC="${PROCESS_RECOVERY_INTERVAL_SEC:-60}"
+    PROCESS_RECOVERY_WINDOW_SEC="${PROCESS_RECOVERY_WINDOW_SEC:-600}"
+    PROCESS_RECOVERY_MAX="${PROCESS_RECOVERY_MAX:-3}"
+    PROCESS_BREAKER_OPEN_SEC="${PROCESS_BREAKER_OPEN_SEC:-600}"
     case "$DATA_PROBE_ENABLED" in
       yes|no) ;;
       *) echo "DATA_PROBE_ENABLED must be yes or no in config: $cfg" >&2; return 1 ;;
     esac
     local probe_key
-    for probe_key in DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC DATA_PROBE_FAIL_THRESHOLD; do
+    for probe_key in DATA_PROBE_INTERVAL_SEC DATA_PROBE_TIMEOUT_SEC DATA_PROBE_FAIL_THRESHOLD \
+      DATA_PROBE_RESTART_WINDOW_SEC DATA_PROBE_RESTART_MAX DATA_PROBE_BREAKER_OPEN_SEC \
+      BUSINESS_IDLE_HOLD_SEC PROCESS_RECOVERY_GRACE_SEC PROCESS_RECOVERY_INTERVAL_SEC PROCESS_RECOVERY_WINDOW_SEC \
+      PROCESS_RECOVERY_MAX PROCESS_BREAKER_OPEN_SEC; do
         if [[ ! "${!probe_key}" =~ ^[1-9][0-9]*$ ]]; then
             echo "$probe_key must be a positive integer in config: $cfg" >&2
             return 1
@@ -1139,6 +1368,7 @@ get_unit_main_pid() {
     pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     case "$pid" in ''|*[!0-9]*) echo 0 ;; *) echo "$pid" ;; esac
 }
+# UNIT 由 load_config 从实例配置加载。
 # shellcheck disable=SC2153
 get_main_pid() { get_unit_main_pid "$UNIT"; }
 get_anchor_pid() { get_unit_main_pid "$ANCHOR_UNIT"; }
@@ -1173,8 +1403,16 @@ is_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }
 get_business_conn_count() {
     local pid="$1"
     (( pid > 0 )) || { echo 0; return; }
-    ss -ntpH "sport = :${BUSINESS_PORT}" 2>/dev/null |
-      awk -v needle="pid=${pid}," '$1=="ESTAB" && index($0,needle){n++} END{print n+0}'
+    # 单次抓取避免逐端口查询之间的时间差；只统计当前 GOST PID 的本地业务入口。
+    ss -ntpH state established 2>/dev/null |
+      awk -v needle="pid=${pid}," -v ports="$BUSINESS_PORTS" '
+        BEGIN { nports=split(ports,p,/ +/); for (i=1;i<=nports;i++) wanted[p[i]]=1 }
+        index($0,needle) {
+          ep=$4; sub(/^.*:/,"",ep)
+          if (wanted[ep]) n++
+        }
+        END { print n+0 }
+      '
 }
 
 get_anchor_conn_count() {
@@ -1227,10 +1465,13 @@ remote_tcp_reachable() {
     return 1
 }
 
+# 经本地 Anchor 入口建立一个新的 logical stream，并验证 payload 能沿当前
+# chain-mtcp -> outer -> Remote echo endpoint 完成一次双向传输。
 data_plane_probe() {
     local host="${ANCHOR_HOST:-127.0.0.1}"
     local port="${ANCHOR_PORT:-12001}"
     local timeout_sec="${DATA_PROBE_TIMEOUT_SEC:-3}"
+
     timeout "$timeout_sec" bash -c '
         exec 3<>"/dev/tcp/${1}/${2}" || exit 1
         printf "P" >&3 || exit 1
@@ -1263,26 +1504,31 @@ write_status_json() {
     local minrtt="${5:-}" rtt="${6:-}" outer="${7:-0}" remote="${8:-unknown}"
     local data_plane="${9:-unknown}" data_failures="${10:-0}"
     local apid acount business astate tmp epoch ts
+    local data_breaker process_breaker
     [[ "$data_failures" =~ ^[0-9]+$ ]] || data_failures=0
     apid="$(get_anchor_pid)"; acount="$(get_anchor_conn_count "$apid")"
     business="$(get_business_conn_count "$pid")"
+    data_breaker="${DATA_PROBE_BREAKER_STATE:-closed}"
+    process_breaker="${PROCESS_BREAKER_STATE:-closed}"
     if (( apid > 0 && acount == 1 )); then astate="up"; elif (( apid > 0 )); then astate="starting"; else astate="down"; fi
     epoch="$(now_epoch)"; ts="$(now_text)"; tmp="${STATUS_JSON}.tmp.$$"
-    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
+    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
       "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$UNIT")" \
-      "$(json_escape "$DST")" "$PORT" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
-      "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
+      "$(json_escape "$DST")" "$PORT" "$(json_escape "$BUSINESS_PORTS")" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
+      "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$data_breaker")" \
+      "$(json_escape "$process_breaker")" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
       "${apid:-0}" "${acount:-0}" "${business:-0}" > "$tmp"
     mv -f "$tmp" "$STATUS_JSON"
 }
+
 ### END CN_LIB ###
 
 ### BEGIN CN_PREWARM ###
 #!/usr/bin/env bash
 set -uo pipefail
 
-CONFIG="${1:-/opt/gost-mtcp/cn/mtcp.conf}"
-LIB="${MTCP_LIB:-/opt/gost-mtcp/cn/mtcp-lib.sh}"
+CONFIG="${1:-/root/9929-gost-mtcp/cn/mtcp.conf}"
+LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 30
@@ -1300,6 +1546,28 @@ LOCK="/run/${LOCK_ID}-prewarm.lock"
 exec {LOCKFD}>"$LOCK"
 flock -n "$LOCKFD" || exit 75
 
+abort_degraded_retry_if_busy() {
+    local phase="$1" pid business count sport info minrtt rtt
+    [[ "$MODE" == "degraded-retry" ]] || return 1
+    pid="$(get_main_pid)"
+    business="$(get_business_conn_count "$pid")"
+    (( business > 0 )) || return 1
+
+    # Watchdog 的 idle 判断与真正切路之间存在时间窗。这里是 destructive
+    # action 前的最后一道闸：一旦业务出现，恢复/保持 Anchor 并保留当前 outer。
+    ensure_anchor || true
+    count="$(get_gost_outer_count "$pid")"
+    sport="$(get_single_sport "$pid" 2>/dev/null || true)"
+    info="$(get_tcp_info "$sport")"; minrtt="${info%%|*}"; rtt="${info#*|}"
+    write_status_json "DEGRADED" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "$count" "yes"
+    log_event "DEGRADED" "PREWARM_ABORT_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+        "mode=$MODE phase=$phase business=$business"
+    exit 10
+}
+
+# v1：Anchor 本身负责建立候选 outer 并在成功后直接留下。
+# 抽慢路时先 stop Anchor，再 kill 当前唯一 outer；避免自动重连竞争。
+abort_degraded_retry_if_busy "before_initial_anchor_stop"
 stop_anchor
 
 start_epoch="$(now_epoch)"
@@ -1325,6 +1593,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
         exit 30
     fi
 
+    # 没有 outer：启动 Anchor。Anchor 会主动发送 1 Byte，触发默认 Relay 并保持 logical stream。
     if (( count == 0 )); then
         stable=0; candidate_sport=""
         if ! ensure_anchor; then
@@ -1347,6 +1616,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
     sport="$(get_single_sport "$pid" 2>/dev/null || true)"
     [[ -n "$sport" ]] || { sleep 0.2; continue; }
 
+    # 若 outer 已存在但 Anchor 尚未挂上，先挂 Anchor；这不会新建第二条 outer，成功后再确认。
     if ! anchor_is_established; then
         if ! ensure_anchor; then
             stop_anchor
@@ -1375,6 +1645,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
         ((stable++))
         write_status_json "FAST" "PATH" "$pid" "$sport" "$minrtt" "$rtt" 1 "yes"
         if (( stable >= ${PREWARM_STABLE_REQUIRED:-2} )); then
+            # 成功时 Anchor 已经在线，因此没有“prewarm 成功后 outer 空窗期”。
             count="$(get_gost_outer_count "$pid")"
             current="$(get_single_sport "$pid" 2>/dev/null || true)"
             if (( count == 1 )) && [[ "$current" == "$sport" ]] && anchor_is_established; then
@@ -1390,6 +1661,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
 
     stable=0
     if (( attempt >= MAX_DRAWS )); then
+        # 抽卡额度耗尽：保留最后一条可用慢路，并保持 Anchor，业务优先。
         write_status_json "DEGRADED" "PATH" "$pid" "$sport" "$minrtt" "$rtt" 1 "yes"
         log_event "DEGRADED" "PREWARM_KEEP_SLOW" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "mode=$MODE attempt=$attempt/$MAX_DRAWS"
         exit 10
@@ -1397,6 +1669,8 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
 
     log_event "DEGRADED" "PREWARM_REJECT_SLOW" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "mode=$MODE attempt=$attempt/$MAX_DRAWS"
 
+    # 先停 Anchor；如果 outer 因最后一个 logical stream 消失而自己释放，就无需再 ss -K。
+    abort_degraded_retry_if_busy "before_anchor_stop"
     stop_anchor
     sleep 0.1
 
@@ -1415,11 +1689,15 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
 
     sport2="$(get_single_sport "$pid" 2>/dev/null || true)"
     if [[ "$sport2" != "$sport" ]]; then
+        # session 已自行换代；把新 sport 当下一张卡，不猜不杀。
         candidate_sport=""; stable=0
         continue
     fi
 
+    abort_degraded_retry_if_busy "before_outer_kill"
+
     if ! kill_outer_sport "$pid" "$sport"; then
+        # 再看一次：若恰好自然消失，按成功清理处理；否则才是故障。
         count3="$(get_gost_outer_count "$pid")"
         if (( count3 == 0 )); then candidate_sport=""; continue; fi
         write_status_json "FAULT" "KILL_FAILED" "$pid" "$sport" "$minrtt" "$rtt" "$count3" "unknown"
@@ -1434,6 +1712,7 @@ while (( $(now_epoch) - start_epoch < ${PREWARM_TOTAL_TIMEOUT_SEC:-120} )); do
     fi
 
     candidate_sport=""; stable=0
+    # 下一轮由 Anchor 建立新的候选 outer。
 done
 
 pid="$(get_main_pid)"; count="$(get_gost_outer_count "$pid")"
@@ -1449,13 +1728,14 @@ stop_anchor
 write_status_json "DOWN" "PREWARM_TIMEOUT" "$pid" "" "" "" "$count" "unknown"
 log_event "DOWN" "PREWARM_TIMEOUT_NO_OUTER" "PREWARM_TIMEOUT" "$pid"
 exit 20
+
 ### END CN_PREWARM ###
 
 ### BEGIN CN_WATCHDOG ###
 #!/usr/bin/env bash
 set -uo pipefail
 
-DEFAULT_CONFIG="${MTCP_CONFIG:-/opt/gost-mtcp/cn/mtcp.conf}"
+DEFAULT_CONFIG="${MTCP_CONFIG:-/root/9929-gost-mtcp/cn/mtcp.conf}"
 CONFIG="${1:-$DEFAULT_CONFIG}"
 ADOPT_MODE=0
 if [[ "${1:-}" == "--adopt" ]]; then
@@ -1465,8 +1745,8 @@ elif [[ "${2:-}" == "--adopt" ]]; then
     ADOPT_MODE=1
 fi
 
-LIB="${MTCP_LIB:-/opt/gost-mtcp/cn/mtcp-lib.sh}"
-PREWARM="${MTCP_PREWARM:-/opt/gost-mtcp/cn/mtcp-prewarm.sh}"
+LIB="${MTCP_LIB:-/root/9929-gost-mtcp/cn/mtcp-lib.sh}"
+PREWARM="${MTCP_PREWARM:-/root/9929-gost-mtcp/cn/mtcp-prewarm.sh}"
 # shellcheck disable=SC1090
 source "$LIB"
 load_config "$CONFIG" || exit 1
@@ -1498,6 +1778,12 @@ reset_runtime_state() {
     ZERO_SINCE=0; WARN_SINCE=0; CRIT_SINCE=0; RECOVER_SINCE=0
     LAST_REMOTE_PROBE=0; REMOTE_OK="unknown"; LAST_RESTART=0; MULTI_SEEN=0
     LAST_DEGRADED_RETRY=0; LAST_RECOVERY_ATTEMPT=0; LAST_ANCHOR_RETRY=0; LAST_PRUNE=0
+    BUSINESS_IDLE_SINCE=0
+    DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+    DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+    LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     reset_data_probe_state
     HAVE_RUNTIME=0
 }
@@ -1507,8 +1793,11 @@ reset_runtime_state
 load_runtime_state() {
     local saved_boot_id
     [[ -r "$STATE_FILE" ]] || return 1
+
+    # 先检查首行 boot ID，避免跨重启状态在校验前污染当前进程变量。
     saved_boot_id="$(awk -F"'" 'NR == 1 && $1 == "SAVED_BOOT_ID=" { print $2; exit }' "$STATE_FILE" 2>/dev/null || true)"
     [[ -n "$saved_boot_id" && "$saved_boot_id" == "$BOOT_ID" ]] || return 1
+
     # shellcheck disable=SC1090
     if ! source "$STATE_FILE"; then
         reset_runtime_state
@@ -1522,10 +1811,36 @@ load_runtime_state() {
     : "${DATA_PROBE_FAILS:=0}"
     : "${DATA_PLANE_OK:=unknown}"
     : "${DATA_PROBE_SPORT:=}"
+    : "${BUSINESS_IDLE_SINCE:=0}"
+    : "${DATA_PROBE_RESTART_EPOCHS:=}"
+    : "${DATA_PROBE_BREAKER_STATE:=closed}"
+    : "${DATA_PROBE_BREAKER_UNTIL:=0}"
+    : "${DATA_PROBE_BREAKER_LOGGED:=0}"
+    : "${PROCESS_RECOVERY_EPOCHS:=}"
+    : "${PROCESS_BREAKER_STATE:=closed}"
+    : "${PROCESS_BREAKER_UNTIL:=0}"
+    : "${PROCESS_BREAKER_LOGGED:=0}"
+    : "${LAST_PROCESS_RECOVERY:=0}"
+    : "${PROCESS_HEALTHY_SINCE:=0}"
+    : "${PROCESS_DOWN_SINCE:=0}"
     if [[ ! "$LAST_DATA_PROBE" =~ ^[0-9]+$ || ! "$DATA_PROBE_FAILS" =~ ^[0-9]+$ ]] ||
        [[ "$DATA_PLANE_OK" != "yes" && "$DATA_PLANE_OK" != "no" && "$DATA_PLANE_OK" != "unknown" ]] ||
        [[ -n "$DATA_PROBE_SPORT" && ! "$DATA_PROBE_SPORT" =~ ^[0-9]+$ ]]; then
         reset_data_probe_state
+    fi
+    if [[ ! "$BUSINESS_IDLE_SINCE" =~ ^[0-9]+$ || ! "$DATA_PROBE_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ || ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ || ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ||
+          ! "$PROCESS_HEALTHY_SINCE" =~ ^[0-9]+$ || ! "$PROCESS_DOWN_SINCE" =~ ^[0-9]+$ ]] ||
+       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] || "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]] ||
+       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+        BUSINESS_IDLE_SINCE=0
+        DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+        DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+        PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+        PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+        LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     fi
     HAVE_RUNTIME=1
     return 0
@@ -1552,12 +1867,152 @@ LAST_DEGRADED_RETRY='$LAST_DEGRADED_RETRY'
 LAST_RECOVERY_ATTEMPT='$LAST_RECOVERY_ATTEMPT'
 LAST_ANCHOR_RETRY='$LAST_ANCHOR_RETRY'
 LAST_PRUNE='$LAST_PRUNE'
+BUSINESS_IDLE_SINCE='$BUSINESS_IDLE_SINCE'
 LAST_DATA_PROBE='$LAST_DATA_PROBE'
 DATA_PROBE_FAILS='$DATA_PROBE_FAILS'
 DATA_PLANE_OK='$DATA_PLANE_OK'
 DATA_PROBE_SPORT='$DATA_PROBE_SPORT'
+DATA_PROBE_RESTART_EPOCHS='$DATA_PROBE_RESTART_EPOCHS'
+DATA_PROBE_BREAKER_STATE='$DATA_PROBE_BREAKER_STATE'
+DATA_PROBE_BREAKER_UNTIL='$DATA_PROBE_BREAKER_UNTIL'
+DATA_PROBE_BREAKER_LOGGED='$DATA_PROBE_BREAKER_LOGGED'
+PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
+PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
+PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
+PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
+LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
+PROCESS_HEALTHY_SINCE='$PROCESS_HEALTHY_SINCE'
+PROCESS_DOWN_SINCE='$PROCESS_DOWN_SINCE'
 STATEEOF
     mv -f "$tmp" "$STATE_FILE"
+}
+
+prune_epoch_list() {
+    local epochs="$1" cutoff="$2" epoch kept=""
+    for epoch in $epochs; do
+        (( epoch >= cutoff )) && kept="${kept:+$kept }$epoch"
+    done
+    printf '%s\n' "$kept"
+}
+
+close_data_probe_breaker() {
+    if [[ "$DATA_PROBE_BREAKER_STATE" != "closed" || -n "$DATA_PROBE_RESTART_EPOCHS" ]]; then
+        log_event "$STATE" "DATA_PROBE_BREAKER_CLOSED" "DATA_PLANE" "$LAST_PID" "$LAST_SPORT"
+    fi
+    DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
+    DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+}
+
+allow_data_probe_restart() {
+    local now="$1" cutoff count half_open=0
+    if [[ "$DATA_PROBE_BREAKER_STATE" == "open" ]]; then
+        if (( now < DATA_PROBE_BREAKER_UNTIL )); then
+            if (( DATA_PROBE_BREAKER_LOGGED == 0 )); then
+                log_event "FAULT" "DATA_PROBE_BREAKER_SUPPRESSED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+                    "until=$DATA_PROBE_BREAKER_UNTIL"
+                DATA_PROBE_BREAKER_LOGGED=1
+            fi
+            return 1
+        fi
+        # 熔断时间到期只放行一次试探；若数据面仍坏，下一轮仍会被抑制。
+        DATA_PROBE_RESTART_EPOCHS=""
+        DATA_PROBE_BREAKER_STATE="closed"; DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
+        half_open=1
+        log_event "FAULT" "DATA_PROBE_BREAKER_HALF_OPEN" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT"
+    fi
+
+    cutoff=$((now - DATA_PROBE_RESTART_WINDOW_SEC))
+    DATA_PROBE_RESTART_EPOCHS="$(prune_epoch_list "$DATA_PROBE_RESTART_EPOCHS" "$cutoff")"
+    count=0; [[ -n "$DATA_PROBE_RESTART_EPOCHS" ]] && count="$(wc -w <<< "$DATA_PROBE_RESTART_EPOCHS" | tr -d ' ')"
+    if (( count >= DATA_PROBE_RESTART_MAX )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_OPEN" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "attempts=$count window=${DATA_PROBE_RESTART_WINDOW_SEC}s until=$DATA_PROBE_BREAKER_UNTIL"
+        return 1
+    fi
+
+    DATA_PROBE_RESTART_EPOCHS="${DATA_PROBE_RESTART_EPOCHS:+$DATA_PROBE_RESTART_EPOCHS }$now"
+    count=$((count + 1))
+    if (( half_open == 1 )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_REARMED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "half_open_attempt=yes until=$DATA_PROBE_BREAKER_UNTIL"
+    elif (( count >= DATA_PROBE_RESTART_MAX )); then
+        DATA_PROBE_BREAKER_STATE="open"; DATA_PROBE_BREAKER_UNTIL=$((now + DATA_PROBE_BREAKER_OPEN_SEC))
+        DATA_PROBE_BREAKER_LOGGED=0
+        log_event "FAULT" "DATA_PROBE_BREAKER_ARMED" "DATA_PROBE" "$LAST_PID" "$LAST_SPORT" "" "" \
+            "attempts=$count window=${DATA_PROBE_RESTART_WINDOW_SEC}s until=$DATA_PROBE_BREAKER_UNTIL"
+    fi
+    return 0
+}
+
+close_process_breaker() {
+    if [[ "$PROCESS_BREAKER_STATE" != "closed" || -n "$PROCESS_RECOVERY_EPOCHS" ]]; then
+        log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    fi
+    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0; LAST_PROCESS_RECOVERY=0
+}
+
+allow_process_recovery() {
+    local now="$1" cutoff count half_open=0
+    if (( LAST_PROCESS_RECOVERY > 0 && now - LAST_PROCESS_RECOVERY < PROCESS_RECOVERY_INTERVAL_SEC )); then
+        return 1
+    fi
+    if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
+        if (( now < PROCESS_BREAKER_UNTIL )); then
+            if (( PROCESS_BREAKER_LOGGED == 0 )); then
+                log_event "FAULT" "PROCESS_BREAKER_SUPPRESSED" "PROCESS" 0 "" "" "" "until=$PROCESS_BREAKER_UNTIL"
+                PROCESS_BREAKER_LOGGED=1
+            fi
+            return 1
+        fi
+        PROCESS_RECOVERY_EPOCHS=""
+        PROCESS_BREAKER_STATE="closed"; PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
+        half_open=1
+        log_event "FAULT" "PROCESS_BREAKER_HALF_OPEN" "PROCESS" 0
+    fi
+    cutoff=$((now - PROCESS_RECOVERY_WINDOW_SEC))
+    PROCESS_RECOVERY_EPOCHS="$(prune_epoch_list "$PROCESS_RECOVERY_EPOCHS" "$cutoff")"
+    count=0; [[ -n "$PROCESS_RECOVERY_EPOCHS" ]] && count="$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
+    if (( count >= PROCESS_RECOVERY_MAX )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_OPEN" "PROCESS" 0 "" "" "" \
+            "attempts=$count window=${PROCESS_RECOVERY_WINDOW_SEC}s until=$PROCESS_BREAKER_UNTIL"
+        return 1
+    fi
+    LAST_PROCESS_RECOVERY="$now"
+    PROCESS_RECOVERY_EPOCHS="${PROCESS_RECOVERY_EPOCHS:+$PROCESS_RECOVERY_EPOCHS }$now"
+    count=$((count + 1))
+    if (( half_open == 1 )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_REARMED" "PROCESS" 0 "" "" "" \
+            "half_open_attempt=yes until=$PROCESS_BREAKER_UNTIL"
+    elif (( count >= PROCESS_RECOVERY_MAX )); then
+        PROCESS_BREAKER_STATE="open"; PROCESS_BREAKER_UNTIL=$((now + PROCESS_BREAKER_OPEN_SEC))
+        PROCESS_BREAKER_LOGGED=0
+        log_event "FAULT" "PROCESS_BREAKER_ARMED" "PROCESS" 0 "" "" "" \
+            "attempts=$count window=${PROCESS_RECOVERY_WINDOW_SEC}s until=$PROCESS_BREAKER_UNTIL"
+    fi
+    return 0
+}
+
+recover_process_rate_limited() {
+    local now="$1"
+    allow_process_recovery "$now" || return 1
+    log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
+        "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
+    systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+    if ! systemctl restart "$UNIT"; then
+        log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
+        return 2
+    fi
+    log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
+    return 0
 }
 
 set_state() {
@@ -1579,6 +2034,9 @@ restart_gost_rate_limited() {
         log_event "FAULT" "RESTART_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
         return 1
     fi
+    if [[ "$reason" == "DATA_PLANE_STALE_OUTER" ]] && ! allow_data_probe_restart "$now"; then
+        return 3
+    fi
     LAST_RESTART="$now"
     stop_anchor
     log_event "FAULT" "RESTART_GOST" "$reason" "$LAST_PID" "$LAST_SPORT"
@@ -1592,10 +2050,12 @@ restart_gost_rate_limited() {
     return 0
 }
 
+# v1 的 prewarm 已经负责：建立候选 Anchor -> 测 minrtt -> 慢路重抽 -> 成功后直接留下 Anchor。
 run_select() {
     local mode="${1:-normal}" cause="${2:-SELECT}" rc pid count sport info minrtt rtt
     reset_data_probe_state
     MTCP_PREWARM_MODE="$mode" "$PREWARM" "$CONFIG"; rc=$?
+
     case "$rc" in
       0|10)
         pid="$(get_main_pid)"; count="$(get_gost_outer_count "$pid")"
@@ -1678,12 +2138,29 @@ while true; do
         stop_anchor
         (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
         LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0
+        PROCESS_HEALTHY_SINCE=0
+        (( PROCESS_DOWN_SINCE == 0 )) && PROCESS_DOWN_SINCE="$now"
         reset_data_probe_state
         DATA_PLANE_OK="no"
         set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
+        if (( now - PROCESS_DOWN_SINCE >= PROCESS_RECOVERY_GRACE_SEC )); then
+            recover_process_rate_limited "$now" || true
+        fi
+        if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
+            set_state "FAULT" "PROCESS_BREAKER" "$pid" "" "" "" 0
+        fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
+    PROCESS_DOWN_SINCE=0
+
+    if (( PROCESS_HEALTHY_SINCE == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
+    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
+        close_process_breaker
+    fi
+
+    # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。
     if (( HAVE_RUNTIME == 0 )); then
         log_event "DOWN" "WATCHDOG_COLD_START" "INIT" "$pid"
         LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0; REMOTE_OK="unknown"
@@ -1697,6 +2174,7 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
+    # 真正的 GOST PID 换代。
     if [[ "$LAST_PID" != "$pid" ]]; then
         old_pid="$LAST_NONZERO_PID"
         (( old_pid > 0 )) || old_pid="$LAST_PID"
@@ -1776,6 +2254,7 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
+    # outer == 1。ESTAB 只证明 socket 仍存在，不能据此推断 Remote 或 MTCP 数据面健康。
     ZERO_SINCE=0; LAST_RECOVERY_ATTEMPT=0
     sport="$(get_single_sport "$pid" 2>/dev/null || true)"
     [[ -n "$sport" ]] || { save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue; }
@@ -1798,6 +2277,7 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
+    # Anchor 自己掉了：优先重新挂回当前 outer，不因辅助组件故障主动重抽。
     if ! anchor_is_established; then
         if (( LAST_ANCHOR_RETRY == 0 || now - LAST_ANCHOR_RETRY >= ${ANCHOR_RETRY_SEC:-60} )); then
             LAST_ANCHOR_RETRY="$now"; before_sport="$sport"
@@ -1825,22 +2305,26 @@ while true; do
         fi
     fi
 
-    # outer=1 只能说明内核仍保留 ESTAB socket；通过 Anchor echo 回路
-    # 收发 payload，才能证明当前 MTCP mux/outer 仍可用。
+    # Data Plane Probe：outer=1 只能说明内核仍保留 ESTAB socket；只有通过
+    # Anchor echo 回路收发 payload，才能证明当前 MTCP mux/outer 仍可用。
     if [[ "$DATA_PROBE_ENABLED" == "no" ]]; then
         if (( LAST_DATA_PROBE != 0 || DATA_PROBE_FAILS != 0 )) || \
            [[ "$DATA_PLANE_OK" != "unknown" || -n "$DATA_PROBE_SPORT" ]]; then
             reset_data_probe_state
         fi
+        # 显式关闭新探测时保持旧版 outer=1 的兼容语义。
+        close_data_probe_breaker
         REMOTE_OK="yes"
     else
         probe_threshold="$DATA_PROBE_FAIL_THRESHOLD"
 
+        # 连续失败只对同一条 outer session 有效。
         if [[ -n "$DATA_PROBE_SPORT" && "$DATA_PROBE_SPORT" != "$sport" ]]; then
             reset_data_probe_state
         fi
 
-        # 已确认 Remote 不可达时只探测 Remote；恢复后再确认一次数据面。
+        # 已确认整条 CN -> Remote 网络不可达时，只按 Remote 探测节奏等待；
+        # Remote 恢复后再做一次 Data Probe，避免断网期间堆积超时 logical stream。
         if [[ "$DATA_PLANE_OK" == "no" && "$REMOTE_OK" == "no" ]] && \
            (( DATA_PROBE_FAILS >= probe_threshold )); then
             if (( LAST_REMOTE_PROBE == 0 || now - LAST_REMOTE_PROBE >= ${REMOTE_PROBE_INTERVAL_SEC:-15} )); then
@@ -1849,12 +2333,14 @@ while true; do
                     REMOTE_OK="yes"
                     log_event "DOWN" "REMOTE_TCP_UP" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" \
                         "data_probe_failures=$DATA_PROBE_FAILS"
+
                     LAST_DATA_PROBE="$now"
                     DATA_PROBE_SPORT="$sport"
                     if data_plane_probe; then
                         previous_failures="$DATA_PROBE_FAILS"
                         DATA_PROBE_FAILS=0
                         DATA_PLANE_OK="yes"
+                        close_data_probe_breaker
                         log_event "$STATE" "DATA_PROBE_RECOVERED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" "previous_failures=$previous_failures"
                     else
@@ -1865,11 +2351,16 @@ while true; do
                         log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" \
                             "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                        restart_rc=$?
+                        if (( restart_rc == 3 )); then
+                            set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                        fi
                         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
                     fi
                 fi
             fi
+
             if [[ "$REMOTE_OK" == "no" ]]; then
                 set_state "DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" 1
                 save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
@@ -1879,6 +2370,7 @@ while true; do
         if (( LAST_DATA_PROBE == 0 || now - LAST_DATA_PROBE >= DATA_PROBE_INTERVAL_SEC )); then
             LAST_DATA_PROBE="$now"
             DATA_PROBE_SPORT="$sport"
+
             if data_plane_probe; then
                 if (( DATA_PROBE_FAILS > 0 )) || [[ "$DATA_PLANE_OK" == "no" ]]; then
                     log_event "$STATE" "DATA_PROBE_RECOVERED" "DATA_PLANE" \
@@ -1887,6 +2379,7 @@ while true; do
                 DATA_PROBE_FAILS=0
                 DATA_PLANE_OK="yes"
                 REMOTE_OK="yes"
+                close_data_probe_breaker
             else
                 DATA_PLANE_OK="no"
                 if (( DATA_PROBE_FAILS < probe_threshold )); then
@@ -1895,6 +2388,7 @@ while true; do
                 log_event "DEGRADED" "DATA_PROBE_FAILED" "DATA_PLANE" \
                     "$pid" "$sport" "$minrtt" "$rtt" \
                     "fail=$DATA_PROBE_FAILS/$probe_threshold"
+
                 if (( DATA_PROBE_FAILS < probe_threshold )); then
                     set_state "DEGRADED" "DATA_PLANE" "$pid" "$sport" "$minrtt" "$rtt" 1
                     save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
@@ -1910,7 +2404,11 @@ while true; do
                     log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                         "$pid" "$sport" "$minrtt" "$rtt" \
                         "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER" || true
+                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                    restart_rc=$?
+                    if (( restart_rc == 3 )); then
+                        set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
+                    fi
                 else
                     REMOTE_OK="no"
                     [[ "$old_remote" == "no" ]] || \
@@ -1922,6 +2420,7 @@ while true; do
             fi
         fi
 
+        # 探测失败状态优先于 PATH/LIVE_RTT，避免下方状态机误覆盖为 FAST。
         if [[ "$DATA_PLANE_OK" == "no" ]]; then
             if [[ "$REMOTE_OK" == "no" ]]; then
                 set_state "DOWN" "REMOTE" "$pid" "$sport" "$minrtt" "$rtt" 1
@@ -1948,19 +2447,28 @@ while true; do
         if (( LAST_DEGRADED_RETRY == 0 )); then LAST_DEGRADED_RETRY="$now"; fi
         if (( now - LAST_DEGRADED_RETRY >= ${DEGRADED_RETRY_SEC:-900} )); then
             if (( business == 0 )); then
-                LAST_DEGRADED_RETRY="$now"
-                log_event "DEGRADED" "DEGRADED_RETRY_IDLE" "PATH" "$pid" "$sport" "$minrtt" "$rtt"
-                run_select degraded-retry "DEGRADED_IDLE_RETRY" || true
-                save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                if (( BUSINESS_IDLE_SINCE == 0 )); then
+                    BUSINESS_IDLE_SINCE="$now"
+                elif (( now - BUSINESS_IDLE_SINCE >= BUSINESS_IDLE_HOLD_SEC )); then
+                    LAST_DEGRADED_RETRY="$now"
+                    log_event "DEGRADED" "DEGRADED_RETRY_IDLE" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+                        "idle_for=$((now - BUSINESS_IDLE_SINCE))s ports=$BUSINESS_PORTS"
+                    run_select degraded-retry "DEGRADED_IDLE_RETRY" || true
+                    BUSINESS_IDLE_SINCE=0
+                    save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+                fi
             else
+                BUSINESS_IDLE_SINCE=0
                 LAST_DEGRADED_RETRY=$((now - ${DEGRADED_RETRY_SEC:-900} + ${DEGRADED_BUSY_DEFER_SEC:-60}))
-                log_event "DEGRADED" "DEGRADED_RETRY_DEFER_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" "business=$business"
+                log_event "DEGRADED" "DEGRADED_RETRY_DEFER_BUSY" "PATH" "$pid" "$sport" "$minrtt" "$rtt" \
+                    "business=$business ports=$BUSINESS_PORTS"
             fi
         fi
     else
-        LAST_DEGRADED_RETRY=0
+        LAST_DEGRADED_RETRY=0; BUSINESS_IDLE_SINCE=0
     fi
 
+    # LIVE RTT 只做状态化，不主动 kill 当前 outer。
     if [[ "$REASON" == "LIVE_RTT_WARN" || "$REASON" == "LIVE_RTT_CRIT" ]]; then
         if [[ -n "$rtt" ]] && is_lt "$rtt" "${LIVE_RTT_RECOVER_MS:-80}"; then
             if (( RECOVER_SINCE == 0 )); then RECOVER_SINCE="$now"; fi
@@ -1991,4 +2499,5 @@ while true; do
     save_runtime_state
     sleep "${WATCH_INTERVAL_SEC:-5}"
 done
+
 ### END CN_WATCHDOG ###
