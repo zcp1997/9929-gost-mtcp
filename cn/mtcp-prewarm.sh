@@ -14,9 +14,9 @@ case "$MODE" in
   *)              MAX_DRAWS="${PREWARM_MAX_DRAWS:-12}" ;;
 esac
 
-LOCK_ID="${UNIT%.service}"
+LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/${LOCK_ID}-prewarm.lock"
+LOCK="/run/gost-pathlock-${LOCK_ID}-prewarm.lock"
 exec {LOCKFD}>"$LOCK"
 flock -n "$LOCKFD" || exit 75
 

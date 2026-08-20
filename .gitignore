@@ -1,6 +1,11 @@
 # GOST binary and runtime state
 cn/gost
 remote/gost
+cn/mtcp.auth
+remote/mtcp.auth
+cn/runtime.yaml
+cn/config.lock
+cn/*.migrated.*
 cn/state/*
 !cn/state/.gitkeep
 cn/instances/
@@ -13,5 +18,10 @@ cn/instances/
 cn/.cn.yaml.tmp.*
 cn/.mtcp.conf.tmp.*
 cn/.gost.tmp.*
+cn/.mtcp.auth.tmp.*
+cn/.runtime.yaml.*
+cn/.compile-config.*
+cn/.shared-update.*
 remote/.gost.tmp.*
 remote/.remote.yaml.tmp.*
+remote/.mtcp.auth.tmp.*

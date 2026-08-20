@@ -17,9 +17,9 @@ PREWARM="${MTCP_PREWARM:-/root/gost-ecmp-pathlock/cn/mtcp-prewarm.sh}"
 source "$LIB"
 load_config "$CONFIG" || exit 1
 
-LOCK_ID="${UNIT%.service}"
+LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/${LOCK_ID}-watchdog.lock"
+LOCK="/run/gost-pathlock-${LOCK_ID}-watchdog.lock"
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
     if (( ADOPT_MODE == 1 )); then
@@ -268,16 +268,33 @@ allow_process_recovery() {
 }
 
 recover_process_rate_limited() {
-    local now="$1"
+    local now="$1" shared_id shared_lock
     allow_process_recovery "$now" || return 1
+    shared_id="${UNIT%.service}"
+    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
+    shared_lock="/run/${shared_id}-process-recovery.lock"
+    exec {PROCESS_LOCK_FD}>"$shared_lock"
+    if ! flock -n "$PROCESS_LOCK_FD"; then
+        exec {PROCESS_LOCK_FD}>&-
+        return 1
+    fi
+
+    # 多条线路的 Watchdog 共享同一个 GOST。拿到全局锁后必须复查，避免它们
+    # 在同一轮同时 restart 公共进程。
+    if service_is_active && (( $(get_main_pid) > 0 )); then
+        exec {PROCESS_LOCK_FD}>&-
+        return 0
+    fi
     log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
         "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
     if ! systemctl restart "$UNIT"; then
         log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
+        exec {PROCESS_LOCK_FD}>&-
         return 2
     fi
     log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
+    exec {PROCESS_LOCK_FD}>&-
     return 0
 }
 
@@ -293,11 +310,12 @@ set_state() {
         "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
 }
 
-restart_gost_rate_limited() {
-    local reason="$1" now
+reset_route_rate_limited() {
+    local reason="$1" now pid count
+    local -a old_sports=()
     now="$(now_epoch)"
     if (( LAST_RESTART > 0 && now - LAST_RESTART < ${RESTART_COOLDOWN_SEC:-300} )); then
-        log_event "FAULT" "RESTART_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
+        log_event "FAULT" "ROUTE_RESET_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
         return 1
     fi
     if [[ "$reason" == "DATA_PLANE_STALE_OUTER" ]] && ! allow_data_probe_restart "$now"; then
@@ -305,13 +323,26 @@ restart_gost_rate_limited() {
     fi
     LAST_RESTART="$now"
     stop_anchor
-    log_event "FAULT" "RESTART_GOST" "$reason" "$LAST_PID" "$LAST_SPORT"
-    if ! systemctl restart "$UNIT"; then
-        log_event "FAULT" "RESTART_GOST_FAILED" "$reason" "$LAST_PID" "$LAST_SPORT"
-        return 2
+    pid="$(get_main_pid)"
+    count="$(get_gost_outer_count "$pid")"
+    log_event "FAULT" "RESET_ROUTE_OUTER" "$reason" "$pid" "$LAST_SPORT" "" "" \
+        "route=$ROUTE_ID count=$count endpoint=$DST:$PORT"
+
+    # 只关闭本线路唯一 Remote endpoint 对应的 outer；共享 GOST 及其他线路不动。
+    # count=0 时清理状态并让下一轮 Anchor 重新触发拨号，不升级为全局 restart。
+    if (( count > 0 )); then
+        mapfile -t old_sports < <(get_gost_outer_sports "$pid")
+        if ! kill_route_outers "$pid" ||
+           ! wait_route_sports_gone "$pid" "${PREWARM_KILL_WAIT_SEC:-2}" "${old_sports[@]}"; then
+            log_event "FAULT" "RESET_ROUTE_OUTER_FAILED" "$reason" "$pid" "$LAST_SPORT" "" "" \
+                "route=$ROUTE_ID count=$(get_gost_outer_count "$pid")"
+            return 2
+        fi
+    else
+        log_event "DOWN" "RESET_ROUTE_NO_OUTER" "$reason" "$pid" "" "" "" "route=$ROUTE_ID"
     fi
-    (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
-    LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
+
+    LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
     reset_data_probe_state
     return 0
 }
@@ -361,7 +392,7 @@ run_select() {
       *)
         STATE="FAULT"; REASON="PREWARM_RC_${rc}"
         log_event "FAULT" "SELECT_PREWARM_FAILED" "$REASON" "$(get_main_pid)" "" "" "" "cause=$cause"
-        restart_gost_rate_limited "$REASON" || true
+        reset_route_rate_limited "$REASON" || true
         return "$rc"
         ;;
     esac
@@ -462,7 +493,7 @@ while true; do
         reset_data_probe_state
         DATA_PLANE_OK="no"
         ((MULTI_SEEN++)); set_state "FAULT" "MULTI_OUTER" "$pid" "" "" "" "$count"
-        if (( MULTI_SEEN >= ${MULTI_CONFIRM_COUNT:-2} )); then restart_gost_rate_limited "MULTI_OUTER" || true; fi
+        if (( MULTI_SEEN >= ${MULTI_CONFIRM_COUNT:-2} )); then reset_route_rate_limited "MULTI_OUTER" || true; fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     else
         MULTI_SEEN=0
@@ -515,7 +546,7 @@ while true; do
         fi
 
         if (( ZERO_SINCE > 0 && now - ZERO_SINCE >= ${STUCK_RESTART_AFTER_SEC:-60} )) && [[ "$REMOTE_OK" == "yes" ]]; then
-            restart_gost_rate_limited "REMOTE_UP_BUT_NO_OUTER" || true
+            reset_route_rate_limited "REMOTE_UP_BUT_NO_OUTER" || true
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -617,7 +648,7 @@ while true; do
                         log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" \
                             "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                        reset_route_rate_limited "DATA_PLANE_STALE_OUTER"
                         restart_rc=$?
                         if (( restart_rc == 3 )); then
                             set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
@@ -670,7 +701,7 @@ while true; do
                     log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                         "$pid" "$sport" "$minrtt" "$rtt" \
                         "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                    reset_route_rate_limited "DATA_PLANE_STALE_OUTER"
                     restart_rc=$?
                     if (( restart_rc == 3 )); then
                         set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1

@@ -35,6 +35,7 @@ emit_file REMOTE_MAIN_SERVICE remote/gost-ecmp-pathlock-remote.service
 emit_file REMOTE_ANCHOR_SERVICE remote/gost-ecmp-pathlock-remote-anchor-endpoint.service
 emit_file CN_YAML cn/cn.yaml
 emit_file CN_MTCP_CONF cn/mtcp.conf
+emit_file CN_COMPILE cn/compile-config.sh
 emit_file CN_MAIN_SERVICE cn/gost-ecmp-pathlock.service
 emit_file CN_ANCHOR_SERVICE cn/gost-ecmp-pathlock-anchor.service
 emit_file CN_WATCHDOG_SERVICE cn/gost-ecmp-pathlock-watchdog.service

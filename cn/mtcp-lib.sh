@@ -3,7 +3,8 @@ set -uo pipefail
 
 CONFIG_DEFAULT="/root/gost-ecmp-pathlock/cn/mtcp.conf"
 CONFIG_KEYS=(
-    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
+    ROUTE_ID UNIT ANCHOR_UNIT WATCHDOG_UNIT CHAIN_NAME ANCHOR_SERVICE
+    DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
     LIVE_RTT_WARN_MS LIVE_RTT_CRIT_MS LIVE_RTT_WARN_HOLD_SEC
     LIVE_RTT_CRIT_HOLD_SEC LIVE_RTT_RECOVER_MS LIVE_RTT_RECOVER_HOLD_SEC
@@ -31,6 +32,24 @@ load_config() {
     unset "${CONFIG_KEYS[@]}"
     # shellcheck disable=SC1090
     source "$cfg" || { echo "config invalid: $cfg" >&2; return 1; }
+
+    ROUTE_ID="${ROUTE_ID:-${ANCHOR_UNIT:-route}}"
+    ROUTE_ID="${ROUTE_ID%.service}"
+    ROUTE_ID="${ROUTE_ID//[^A-Za-z0-9_-]/_}"
+    [[ "$ROUTE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
+        echo "invalid ROUTE_ID in config: $cfg" >&2
+        return 1
+    }
+    CHAIN_NAME="${CHAIN_NAME:-chain-mtcp-$ROUTE_ID}"
+    ANCHOR_SERVICE="${ANCHOR_SERVICE:-mtcp-anchor-$ROUTE_ID}"
+    [[ "$CHAIN_NAME" =~ ^chain-mtcp-[A-Za-z0-9_-]+$ ]] || {
+        echo "invalid CHAIN_NAME in config: $cfg" >&2
+        return 1
+    }
+    [[ "$ANCHOR_SERVICE" =~ ^mtcp-anchor-[A-Za-z0-9_-]+$ ]] || {
+        echo "invalid ANCHOR_SERVICE in config: $cfg" >&2
+        return 1
+    }
 
     local required
     for required in UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT ACCEPT_RTT_MS; do
@@ -267,6 +286,39 @@ wait_outer_gone() {
     return 1
 }
 
+kill_route_outers() {
+    local pid="$1" sport killed=0
+    local -a sports=()
+    (( pid > 0 )) || return 1
+    mapfile -t sports < <(get_gost_outer_sports "$pid")
+    (( ${#sports[@]} > 0 )) || return 1
+    for sport in "${sports[@]}"; do
+        if ss -K "dst ${DST}:${PORT} sport = :${sport}" >/dev/null 2>&1; then
+            killed=$((killed + 1))
+        fi
+    done
+    (( killed == ${#sports[@]} ))
+}
+
+wait_route_sports_gone() {
+    local pid="$1" timeout_sec="$2" deadline current old found
+    shift 2
+    local -a old_sports=("$@") current_sports=()
+    deadline=$((SECONDS + timeout_sec))
+    while (( SECONDS < deadline )); do
+        mapfile -t current_sports < <(get_gost_outer_sports "$pid")
+        found=0
+        for old in "${old_sports[@]}"; do
+            for current in "${current_sports[@]}"; do
+                [[ "$current" == "$old" ]] && found=1
+            done
+        done
+        (( found == 0 )) && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 write_status_json() {
     local state="${1:-UNKNOWN}" reason="${2:-}" pid="${3:-0}" sport="${4:-}"
     local minrtt="${5:-}" rtt="${6:-}" outer="${7:-0}" remote="${8:-unknown}"
@@ -280,8 +332,8 @@ write_status_json() {
     process_breaker="${PROCESS_BREAKER_STATE:-closed}"
     if (( apid > 0 && acount == 1 )); then astate="up"; elif (( apid > 0 )); then astate="starting"; else astate="down"; fi
     epoch="$(now_epoch)"; ts="$(now_text)"; tmp="${STATUS_JSON}.tmp.$$"
-    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
-      "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$UNIT")" \
+    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","route":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
+      "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$ROUTE_ID")" "$(json_escape "$UNIT")" \
       "$(json_escape "$DST")" "$PORT" "$(json_escape "$BUSINESS_PORTS")" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
       "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$data_breaker")" \
       "$(json_escape "$process_breaker")" "$(json_escape "$ANCHOR_UNIT")" "$astate" \

@@ -6,13 +6,11 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s remote
 #   curl -fsSL https://raw.githubusercontent.com/.../standalone-install.sh | bash -s cn
 #
-# 或下载后执行（也可用于 Relay 管理）：
+# 或下载后直接进入菜单（也保留 cn/remote/relay 命令用于自动化）：
 #   wget https://raw.githubusercontent.com/.../standalone-install.sh
-#   bash standalone-install.sh remote
-#   bash standalone-install.sh cn
-#   bash standalone-install.sh relay
+#   bash standalone-install.sh
 
-VERSION="1.2.0"
+VERSION="2.1.0"
 INSTALL_BASE="${INSTALL_BASE:-/opt/gost-mtcp}"
 GOST_VERSION="${GOST_VERSION:-v3.2.6}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
@@ -20,7 +18,11 @@ SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 EMBEDDED_SOURCE=""
 PROMPT_FD=0
 PROMPT_FD_READY=0
+PATHLOCK_INTERACTIVE_MENU=0
+MTCP_AUTH_USERNAME="mtcp"
 declare -a CLEANUP_PATHS=()
+declare -a DISCOVERED_CN_YAMLS=()
+declare -a DISCOVERED_CN_CONFIGS=()
 
 cleanup() {
     local status=$? path
@@ -37,9 +39,9 @@ trap cleanup EXIT
 show_banner() {
     cat <<'BANNER'
 ============================================================
-  gost-ecmp-pathlock 自包含安装器 v1.2.0
+  gost-ecmp-pathlock 自包含安装器 v2.1.0
 
-  基于 GOST MTCP 的 ECMP 低延迟路径优选方案
+  基于单 GOST 进程 + 多 MTCP 线路的 ECMP 低延迟路径优选方案
 ============================================================
 BANNER
 }
@@ -47,36 +49,38 @@ BANNER
 show_usage() {
     cat <<'USAGE'
 用法：
-  bash standalone-install.sh             交互选择角色
-  bash standalone-install.sh cn          安装 CN 端
-  bash standalone-install.sh remote      安装 Remote 端
-  bash standalone-install.sh relay       交互管理 CN 端口 Relay
-  bash standalone-install.sh relay list  列出 CN 端口 Relay
-  bash standalone-install.sh relay add   增加 CN 端口 Relay
+  bash standalone-install.sh             打开统一管理菜单
+  bash standalone-install.sh list        列出已有配置与端口路径
+  bash standalone-install.sh logs        选择线路并查看 JSONL 日志
+  bash standalone-install.sh cn          直接安装 CN 端
+  bash standalone-install.sh remote      直接安装 Remote 端
+  bash standalone-install.sh relay       选择线路并管理端口转发
+  bash standalone-install.sh relay list  选择线路并列出端口转发
+  bash standalone-install.sh relay add   选择线路并增加端口转发
   bash standalone-install.sh relay remove [服务名]
-                                        删除 CN 端口 Relay
+                                        选择线路并删除端口转发
   bash standalone-install.sh --help      查看帮助
 
 环境变量：
   INSTALL_BASE               安装目录（默认 /opt/gost-mtcp）
   GOST_VERSION               GOST 版本（默认 v3.2.6）
   GITHUB_PROXY_PREFIX        GitHub 镜像前缀（CN 默认 https://ghfast.top/）
-  CN_YAML_PATH               Relay 管理使用的 cn.yaml 路径（可选）
-  CN_MTCP_CONFIG_PATH        Relay 管理使用的 mtcp.conf 路径（可选）
-  CN_INSTANCE                Relay 管理的线路别名；安装多条线路时必须指定
+  CN_YAML_PATH               自动化 Relay 管理使用的 cn.yaml 路径（可选）
+  CN_MTCP_CONFIG_PATH        自动化 Relay 管理使用的 mtcp.conf 路径（可选）
+  CN_INSTANCE                自动化 Relay 管理使用的线路别名（可选；菜单无需设置）
+  MTCP_AUTH_PASSWORD         自动化安装用鉴权密码（两端相同，交互安装建议不设置）
+  CN_FORCE_RESTART=1         有活跃业务时仍允许重启共享 GOST
 
 示例：
-  # Remote 端
-  bash standalone-install.sh remote
+  # 日常管理：安装、配置清单、端口转发和日志都从这里进入
+  bash standalone-install.sh
 
-  # CN 端（自动使用 ghfast 镜像）
+  # 自动化仍可直接指定角色
+  bash standalone-install.sh remote
   bash standalone-install.sh cn
 
   # CN 端强制直连 GitHub
   GITHUB_PROXY_PREFIX= bash standalone-install.sh cn
-
-  # 增加 :12002 -> 127.0.0.1:2347 Relay
-  bash standalone-install.sh relay add
 
   # 单命令安装（交互输入会直接读取当前终端）
   curl -fsSL https://example.com/install.sh | bash -s cn
@@ -136,50 +140,85 @@ prompt_read() {
     printf -v "$output_var" '%s' "$value"
 }
 
+prompt_secret() {
+    local output_var="$1" prompt="$2" value
+    prepare_prompt_input
+    IFS= read -r -s -u "$PROMPT_FD" -p "$prompt" value || return 1
+    printf '\n' >&2
+    printf -v "$output_var" '%s' "$value"
+}
+
+valid_mtcp_auth_password() {
+    local password="${1-}"
+
+    (( ${#password} >= 12 && ${#password} <= 128 )) || return 1
+    [[ "$password" =~ ^[A-Za-z0-9._~!@#%+=:,/-]+$ ]]
+}
+
+get_mtcp_auth_password() {
+    local output_var="$1" prompt="$2" password confirmation
+
+    if [[ -n "${MTCP_AUTH_PASSWORD+x}" ]]; then
+        password="$MTCP_AUTH_PASSWORD"
+        valid_mtcp_auth_password "$password" || \
+            die "MTCP_AUTH_PASSWORD 无效：长度须为 12-128，只能包含字母、数字及 ._~!@#%+=:,/-"
+    else
+        while :; do
+            prompt_secret password "$prompt: " || die "未输入 MTCP 鉴权密码"
+            if ! valid_mtcp_auth_password "$password"; then
+                echo "密码长度须为 12-128，只能包含字母、数字及 ._~!@#%+=:,/-，请重新输入。" >&2
+                continue
+            fi
+            prompt_secret confirmation "请再次输入以确认: " || die "未确认 MTCP 鉴权密码"
+            if [[ "$password" != "$confirmation" ]]; then
+                echo "两次输入的密码不一致，请重新输入。" >&2
+                continue
+            fi
+            break
+        done
+    fi
+
+    printf -v "$output_var" '%s' "$password"
+}
+
+write_mtcp_auth_file() {
+    local destination="$1" password="$2"
+
+    (umask 077; printf '%s %s\n' "$MTCP_AUTH_USERNAME" "$password" > "$destination")
+    chmod 0600 "$destination"
+}
+
 # 从脚本末尾提取嵌入的文件
 extract_embedded() {
     local marker="$1"
     sed -n "/^### BEGIN ${marker} ###$/,/^### END ${marker} ###$/p" "$EMBEDDED_SOURCE" | sed '1d;$d'
 }
 
-normalize_role() {
-    case "${1:-}" in
-        1|cn|CN) echo "cn" ;;
-        2|remote|REMOTE|Remote) echo "remote" ;;
-        3|relay|RELAY|Relay) echo "relay" ;;
-        *) return 1 ;;
-    esac
-}
+select_install_role() {
+    local output_var="$1" choice role confirm
+    while :; do
+        cat <<'MENU'
 
-select_role_interactively() {
-    cat <<'MENU'
-
-请选择当前服务器的角色：
+全新安装：
 
   1) CN      中国大陆入口端（接收业务、路径优选）
   2) Remote  境外中转端（监听 MTCP、连接后端）
-  3) Relay   管理已安装 CN 的端口转发
-  q) 退出
+  b) 返回主菜单
 
 建议先安装 Remote，再安装 CN。
 MENU
-
-    local choice
-    while :; do
-        prompt_read choice "请选择 [1/2/3/q]: " || die "未选择角色"
+        prompt_read choice "请选择 [1/2/b]: " || return 1
         case "$choice" in
-            q|Q|quit|exit) echo "已取消。"; exit 0 ;;
-            1|2|3)
-                SELECTED_ROLE=$(normalize_role "$choice")
-                [[ "$SELECTED_ROLE" == "relay" ]] && return
-                prompt_read confirm "确认安装 $SELECTED_ROLE 端？[Y/n]: " || die "未确认安装"
-                case "${confirm:-y}" in
-                    y|Y|yes|YES|"") return ;;
-                    *) continue ;;
-                esac
-                ;;
-            "") ;;
-            *) echo "无效输入" >&2 ;;
+            1) role="cn" ;;
+            2) role="remote" ;;
+            b|B|back|q|Q) return 1 ;;
+            "") continue ;;
+            *) echo "无效输入" >&2; continue ;;
+        esac
+        prompt_read confirm "确认安装 $role 端？[Y/n]: " || return 1
+        case "${confirm:-y}" in
+            y|Y|yes|YES|"") printf -v "$output_var" '%s' "$role"; return 0 ;;
+            *) ;;
         esac
     done
 }
@@ -272,6 +311,14 @@ valid_ipv4() {
     done
 }
 
+normalize_ipv4() {
+    local value="$1"
+    local -a octets
+    IFS=. read -r -a octets <<< "$value"
+    printf '%d.%d.%d.%d\n' "$((10#${octets[0]}))" "$((10#${octets[1]}))" \
+        "$((10#${octets[2]}))" "$((10#${octets[3]}))"
+}
+
 ensure_units_inactive() {
     local label="$1" unit
     shift
@@ -285,13 +332,27 @@ ensure_units_inactive() {
 }
 
 ensure_cn_port_available() {
-    local wanted="$1" current_config="$2" target_unit="$3" config configured_unit values value
+    local wanted="$1" current_config="$2" _target_unit="$3" legacy_unit="${4:-}"
+    local config configured_unit values value current_owns=0
+    if [[ -f "$current_config" ]]; then
+        values="$(awk -F= '
+            $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
+                value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
+            }
+        ' "$current_config")"
+        values="${values//,/ }"
+        for value in $values; do [[ "$value" == "$wanted" ]] && current_owns=1; done
+    fi
     for config in "$INSTALL_BASE"/cn/instances/*/mtcp.conf "$INSTALL_BASE"/cn/mtcp.conf; do
         [[ -f "$config" && "$config" != "$current_config" ]] || continue
+        if [[ "${PATHLOCK_SOURCE_TREE:-0}" == 1 && "$config" == "$INSTALL_BASE/cn/mtcp.conf" ]]; then
+            [[ "$(read_config_value "$config" DST 2>/dev/null || true)" == "remote.example.invalid" ]] && continue
+        fi
         configured_unit="$(read_config_value "$config" UNIT 2>/dev/null || true)"
-        # v1.1 standalone 使用 cn/mtcp.conf 平铺布局；同一 UNIT 表示正在迁移的旧实例，
-        # 不能把它自己的业务/Anchor 端口误判为另一条线路的冲突。
-        [[ "$configured_unit" == "$target_unit" ]] && continue
+        # 只跳过正在迁移的旧版平铺线路。共享架构下所有新实例的 UNIT 相同，
+        # 绝不能再按 UNIT 跳过，否则会漏掉其他线路的端口冲突。
+        [[ -n "$legacy_unit" && "$configured_unit" == "$legacy_unit" &&
+           "$config" == "$INSTALL_BASE/cn/mtcp.conf" ]] && continue
         values="$(awk -F= '
             $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
                 value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
@@ -302,9 +363,216 @@ ensure_cn_port_available() {
             [[ "$value" == "$wanted" ]] && die "本机端口 $wanted 已被另一条线路配置占用: $config"
         done
     done
-    if ss -ltnH "sport = :$wanted" 2>/dev/null | grep -q .; then
+    if (( current_owns == 0 )) && ss -ltnH "sport = :$wanted" 2>/dev/null | grep -q .; then
         die "本机端口 $wanted 已被其他进程监听"
     fi
+}
+
+render_cn_route_yaml() {
+    local source="$1" destination="$2" route="$3" remote_addr="$4"
+    local business_addr="$5" anchor_addr="$6" auth_file="$7"
+
+    awk -v route="$route" -v remote_addr="$remote_addr" -v business_addr="$business_addr" \
+        -v anchor_addr="$anchor_addr" -v auth_file="$auth_file" '
+        function yaml_quote(value) {
+            gsub(/\047/, "\047\047", value)
+            return "\047" value "\047"
+        }
+        function indentation(value) {
+            match(value, /[^ ]/)
+            return RSTART > 0 ? RSTART - 1 : length(value)
+        }
+        BEGIN {
+            primary_name="tcp-entry-" route
+            anchor_name="mtcp-anchor-" route
+            chain_name="chain-mtcp-" route
+            hop_name="remote-" route
+            node_name="remote-mtcp-" route
+            print "# pathlock-route: " route
+        }
+        {
+            line=$0
+            if (line ~ /^# pathlock-route:[[:space:]]*/) next
+
+            if (skip_connector_auth) {
+                if (line ~ /^[[:space:]]*$/) next
+                if (indentation(line) > 8) next
+                skip_connector_auth=0
+            }
+
+            if (line ~ /^services:[[:space:]]*$/) {
+                section="services"
+            } else if (line ~ /^chains:[[:space:]]*$/) {
+                section="chains"
+                current_service=""
+            }
+
+            if (section == "services" && line ~ /^- name:[[:space:]]*/) {
+                name=line
+                sub(/^- name:[[:space:]]*/, "", name)
+                sub(/[[:space:]]+$/, "", name)
+                if (name == "tcp-entry" || name == "tcp-entry-default" || name == primary_name) {
+                    line="- name: " primary_name
+                    current_service="primary"
+                    primary_seen++
+                } else if (name == "mtcp-anchor" || name == "mtcp-anchor-default" || name == anchor_name) {
+                    line="- name: " anchor_name
+                    current_service="anchor"
+                    anchor_seen++
+                } else {
+                    current_service="relay"
+                }
+            }
+            if (section == "services" && current_service != "" && line ~ /^  addr:[[:space:]]*/) {
+                if (current_service == "primary") {
+                    line="  addr: " business_addr
+                    primary_addr_seen++
+                } else if (current_service == "anchor") {
+                    line="  addr: " anchor_addr
+                    anchor_addr_seen++
+                }
+                current_service=""
+            }
+            if (section == "services" && (line ~ /^    chain:[[:space:]]*chain-mtcp[[:space:]]*$/ ||
+                line ~ /^    chain:[[:space:]]*chain-mtcp-default[[:space:]]*$/ ||
+                line == "    chain: " chain_name)) {
+                line="    chain: " chain_name
+            }
+
+            if (section == "chains" && (line ~ /^- name:[[:space:]]*chain-mtcp[[:space:]]*$/ ||
+                line ~ /^- name:[[:space:]]*chain-mtcp-default[[:space:]]*$/ ||
+                line == "- name: " chain_name)) {
+                line="- name: " chain_name
+                chain_seen++
+            }
+            if (section == "chains" && (line ~ /^  - name:[[:space:]]*remote[[:space:]]*$/ ||
+                line ~ /^  - name:[[:space:]]*remote-default[[:space:]]*$/ ||
+                line == "  - name: " hop_name)) {
+                line="  - name: " hop_name
+            }
+            if (section == "chains" && (line ~ /^    - name:[[:space:]]*remote-mtcp[[:space:]]*$/ ||
+                line ~ /^    - name:[[:space:]]*remote-mtcp-default[[:space:]]*$/ ||
+                line == "    - name: " node_name)) {
+                line="    - name: " node_name
+                in_remote_node=1
+                remote_node_seen++
+                in_connector=0
+            } else if (section == "chains" && line ~ /^    - name:[[:space:]]*/) {
+                in_remote_node=0
+                in_connector=0
+            }
+            if (in_remote_node && line ~ /^      addr:[[:space:]]*/) {
+                line="      addr: " remote_addr
+                remote_addr_seen++
+            }
+            if (in_remote_node && line ~ /^      connector:[[:space:]]*$/) {
+                in_connector=1
+                connector_seen++
+            } else if (in_connector && line ~ /^      [^ ]/) {
+                in_connector=0
+            }
+            if (in_connector && line ~ /^        auth:[[:space:]]*$/) {
+                skip_connector_auth=1
+                next
+            }
+            if (in_connector && line ~ /^        type:[[:space:]]*relay[[:space:]]*$/) {
+                print line
+                print "        auth:"
+                print "          file: " yaml_quote(auth_file)
+                auth_seen++
+                next
+            }
+            print line
+        }
+        END {
+            if (primary_seen != 1 || anchor_seen != 1 || primary_addr_seen != 1 ||
+                anchor_addr_seen != 1 || chain_seen != 1 || remote_node_seen != 1 ||
+                remote_addr_seen != 1 || connector_seen != 1 || auth_seen != 1) exit 42
+        }
+    ' "$source" > "$destination"
+}
+
+compile_cn_runtime_candidate() {
+    local cn_dir="$1" target_fragment="$2" candidate_fragment="$3" output="$4" path found=0
+    local -a fragments=()
+
+    for path in "$cn_dir"/instances/*/cn.yaml; do
+        [[ -f "$path" ]] || continue
+        if [[ "$path" == "$target_fragment" ]]; then
+            fragments+=("$candidate_fragment")
+            found=1
+        elif grep -q '^# pathlock-route:[[:space:]]*' "$path"; then
+            fragments+=("$path")
+        else
+            echo "提示: 暂不纳入尚未迁移的旧线路 $(basename "$(dirname "$path")")；请随后重装该线路。" >&2
+        fi
+    done
+    (( found == 1 )) || fragments+=("$candidate_fragment")
+    (( ${#fragments[@]} > 0 )) || die "没有可编译的 CN 线路配置"
+    "$cn_dir/compile-config.sh" "$output" "${fragments[@]}"
+}
+
+stop_cn_route_controls() {
+    local cn_dir="$1" config anchor watchdog
+    for config in "$cn_dir"/instances/*/mtcp.conf; do
+        [[ -r "$config" ]] || continue
+        anchor="$(read_config_value "$config" ANCHOR_UNIT 2>/dev/null || true)"
+        watchdog="$(read_config_value "$config" WATCHDOG_UNIT 2>/dev/null || true)"
+        [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] && \
+            "$SYSTEMCTL_BIN" stop "$watchdog" >/dev/null 2>&1 || true
+        [[ "$anchor" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] && \
+            "$SYSTEMCTL_BIN" stop "$anchor" >/dev/null 2>&1 || true
+    done
+}
+
+cn_active_business_count() {
+    local cn_dir="$1" config values port count=0 seen=" " current
+    for config in "$cn_dir"/instances/*/mtcp.conf; do
+        [[ -r "$config" ]] || continue
+        values="$(read_config_value "$config" BUSINESS_PORTS 2>/dev/null || true)"
+        [[ -n "$values" ]] || values="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
+        values="${values//,/ }"
+        for port in $values; do
+            valid_port "$port" || continue
+            [[ "$seen" != *" $port "* ]] || continue
+            seen+="$port "
+            current="$(ss -Hnt state established "sport = :$port" 2>/dev/null | awk 'END { print NR+0 }')"
+            count=$((count + current))
+        done
+    done
+    printf '%s\n' "$count"
+}
+
+require_cn_restart_window() {
+    local cn_dir="$1" main_unit="$2" active
+    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" >/dev/null 2>&1 || return 0
+    active="$(cn_active_business_count "$cn_dir")"
+    (( active == 0 )) && return 0
+    if [[ "${CN_FORCE_RESTART:-0}" != 1 ]]; then
+        if [[ "$PATHLOCK_INTERACTIVE_MENU" == 1 ]]; then
+            local confirm
+            echo "警告: 检测到 $active 条活跃业务连接；本次变更会重启共享 GOST，并中断所有线路现有连接。" >&2
+            prompt_read confirm "确认现在中断并继续？[y/N]: " || die "操作已取消"
+            case "$confirm" in
+                y|Y|yes|YES) echo "已确认中断 $active 条活跃业务连接。" >&2; return 0 ;;
+                *) die "操作已取消，配置未修改" ;;
+            esac
+        fi
+        die "检测到 $active 条活跃业务连接，默认拒绝重启共享 GOST；确认可中断后使用 CN_FORCE_RESTART=1 重试"
+    fi
+    echo "警告: CN_FORCE_RESTART=1，将中断 $active 条活跃业务连接。" >&2
+}
+
+start_cn_route_watchdogs() {
+    local cn_dir="$1" config watchdog
+    for config in "$cn_dir"/instances/*/mtcp.conf; do
+        [[ -r "$config" ]] || continue
+        watchdog="$(read_config_value "$config" WATCHDOG_UNIT 2>/dev/null || true)"
+        [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
+        [[ -e "$SYSTEMD_DIR/$watchdog" || -L "$SYSTEMD_DIR/$watchdog" ]] || continue
+        "$SYSTEMCTL_BIN" enable "$watchdog" >/dev/null 2>&1 || true
+        "$SYSTEMCTL_BIN" restart "$watchdog" || return 1
+    done
 }
 
 install_remote() {
@@ -313,7 +581,7 @@ install_remote() {
 
     local remote_dir="$INSTALL_BASE/remote" main_unit="gost-mtcp-remote.service"
     local anchor_unit="gost-mtcp-remote-anchor.service" mtcp_port socat_bin
-    local config_tmp main_tmp anchor_tmp
+    local auth_file auth_password config_tmp auth_tmp main_tmp anchor_tmp
     ensure_units_inactive "Remote" "$main_unit" "$anchor_unit"
     mkdir -p "$remote_dir" "$SYSTEMD_DIR"
     socat_bin="$(command -v socat)"
@@ -323,16 +591,59 @@ install_remote() {
     valid_port "$mtcp_port" || die "端口无效"
     mtcp_port=$((10#$mtcp_port))
     [[ "$mtcp_port" != 12346 ]] || die "12346 被 Anchor endpoint 占用"
+    get_mtcp_auth_password auth_password "请设置 Remote MTCP 鉴权密码"
+    auth_file="$remote_dir/mtcp.auth"
 
     download_gost remote "$remote_dir"
-    config_tmp="$(mktemp "$remote_dir/.remote.yaml.XXXXXX")"; CLEANUP_PATHS+=("$config_tmp")
-    extract_embedded REMOTE_YAML | awk -v addr=":$mtcp_port" '
-        /^[[:space:]]*-[[:space:]]name:[[:space:]]*mtcp-server[[:space:]]*$/ { target=1 }
-        target && /^[[:space:]]*addr:[[:space:]]*/ { sub(/addr:.*/, "addr: " addr); target=0; updated++ }
-        { print }
-        END { if (updated != 1) exit 42 }
-    ' > "$config_tmp" || die "canonical Remote 配置结构不符合预期"
-    chmod 0644 "$config_tmp"; mv -f "$config_tmp" "$remote_dir/remote.yaml"
+    config_tmp="$(mktemp "$remote_dir/.remote.yaml.XXXXXX")"
+    auth_tmp="$(mktemp "$remote_dir/.mtcp.auth.XXXXXX")"
+    CLEANUP_PATHS+=("$config_tmp" "$auth_tmp")
+    write_mtcp_auth_file "$auth_tmp" "$auth_password"
+    extract_embedded REMOTE_YAML | awk -v addr=":$mtcp_port" -v auth_file="$auth_file" '
+        function yaml_quote(value) {
+            gsub(/\047/, "\047\047", value)
+            return "\047" value "\047"
+        }
+        {
+            line = $0
+            if (line ~ /^authers:[[:space:]]*$/) {
+                in_authers = 1; in_service = 0; in_handler = 0; authers_seen++
+            } else if (!in_authers && line ~ /^- name:[[:space:]]*/) {
+                in_service = (line ~ /^- name:[[:space:]]*mtcp-server[[:space:]]*$/)
+                in_handler = 0
+                if (in_service) service_seen++
+            } else if (in_authers && line ~ /^- name:[[:space:]]*/) {
+                in_mtcp_auther = (line ~ /^- name:[[:space:]]*mtcp-auth[[:space:]]*$/)
+                if (in_mtcp_auther) mtcp_auther_seen++
+            }
+            if (in_service && line ~ /^  addr:[[:space:]]*/) {
+                sub(/addr:.*/, "addr: " addr, line); listen_updated++
+            }
+            if (in_service && line ~ /^  handler:[[:space:]]*$/) {
+                in_handler = 1
+            } else if (in_handler && line ~ /^  [^ ]/) {
+                in_handler = 0
+            }
+            if (in_handler && line ~ /^    auther:[[:space:]]*/) next
+            if (in_handler && line ~ /^    type:[[:space:]]*relay[[:space:]]*$/) {
+                print line
+                print "    auther: mtcp-auth"
+                auth_ref_updated++
+                next
+            }
+            if (in_mtcp_auther && line ~ /^    path:[[:space:]]*/) {
+                line = "    path: " yaml_quote(auth_file); auth_path_updated++
+            }
+            print line
+        }
+        END {
+            if (service_seen != 1 || listen_updated != 1 || auth_ref_updated != 1 ||
+                authers_seen != 1 || mtcp_auther_seen != 1 || auth_path_updated != 1) exit 42
+        }
+    ' > "$config_tmp" || die "canonical Remote 监听或鉴权配置结构不符合预期"
+    chmod 0644 "$config_tmp"
+    mv -f "$auth_tmp" "$auth_file"
+    mv -f "$config_tmp" "$remote_dir/remote.yaml"
 
     main_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote.XXXXXX")"
     anchor_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote-anchor.XXXXXX")"
@@ -359,24 +670,35 @@ install_remote() {
 ============================================================
   Remote 端安装完成
 ============================================================
-MTCP 监听端口: $mtcp_port
+MTCP 监听端口: $mtcp_port    Relay 鉴权: 已启用
 配置文件: $remote_dir/remote.yaml
+鉴权文件: ${auth_file}（权限 0600）
 服务: $main_unit, $anchor_unit
-重要: 请只允许 CN 公网 IP 访问 $mtcp_port/tcp
+下一步: 安装 CN 时输入本次设置的同一密码
+重要: 仍应只允许 CN 公网 IP 访问 $mtcp_port/tcp
 ============================================================
 DONE
 }
 
 install_cn() {
-    echo; echo "==> 开始安装 CN 端"; echo
+    echo; echo "==> 开始安装 CN 端（共享 GOST）"; echo
     check_command curl; check_command tar; check_command "$SYSTEMCTL_BIN"
     check_command ss; check_command flock; check_command timeout
 
-    local cn_dir="$INSTALL_BASE/cn" remote_alias remote_ip remote_port business_port anchor_port rtt_threshold
-    local unit_prefix main_unit anchor_unit watchdog_unit instance_dir state_dir
-    local yaml_template yaml_tmp conf_tmp business_ports legacy_unit
+    local cn_dir="$INSTALL_BASE/cn" runtime_yaml main_unit="gost-mtcp.service"
+    local remote_alias remote_ip remote_port business_port anchor_port rtt_threshold auth_password
+    local route_prefix anchor_unit watchdog_unit legacy_main_unit instance_dir state_dir auth_file
+    local anchor_service chain_name
+    local yaml_template yaml_tmp conf_tmp auth_tmp runtime_tmp compile_tmp
     local lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
-    mkdir -p "$cn_dir/instances"
+    local business_ports legacy_unit config other_dst other_port migration_stamp
+    local backup_dir restart_ok=0
+
+    cn_dir="$INSTALL_BASE/cn"
+    runtime_yaml="$cn_dir/runtime.yaml"
+    mkdir -p "$cn_dir/instances" "$SYSTEMD_DIR"
+    exec 8>"$cn_dir/config.lock"
+    flock -n 8 || die "另一项 CN 配置操作正在进行"
 
     echo "配置参数:"; echo
     prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
@@ -384,104 +706,144 @@ install_cn() {
     [[ "$remote_alias" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "线路别名无效"
     case "$remote_alias" in anchor|watchdog|*-anchor|*-watchdog) die "线路别名使用了保留后缀" ;; esac
 
-    unit_prefix="gost-mtcp"
-    [[ "$remote_alias" != default ]] && unit_prefix="gost-mtcp-$remote_alias"
-    main_unit="$unit_prefix.service"; anchor_unit="$unit_prefix-anchor.service"
-    watchdog_unit="$unit_prefix-watchdog.service"
-    instance_dir="$cn_dir/instances/$remote_alias"; state_dir="$instance_dir/state"
-    ensure_units_inactive "CN 线路 $remote_alias" "$watchdog_unit" "$anchor_unit" "$main_unit"
-    mkdir -p "$state_dir" "$SYSTEMD_DIR"
+    route_prefix="gost-mtcp"
+    [[ "$remote_alias" != default ]] && route_prefix="gost-mtcp-$remote_alias"
+    anchor_unit="$route_prefix-anchor.service"
+    watchdog_unit="$route_prefix-watchdog.service"
+    legacy_main_unit="$route_prefix.service"
+    if [[ "${PATHLOCK_SOURCE_TREE:-0}" == 1 ]]; then
+        legacy_main_unit="gost-ecmp-pathlock.service"
+        [[ "$remote_alias" != default ]] && legacy_main_unit="gost-ecmp-pathlock-$remote_alias.service"
+    fi
+    instance_dir="$cn_dir/instances/$remote_alias"
+    state_dir="$instance_dir/state"
+    auth_file="$instance_dir/mtcp.auth"
+    anchor_service="mtcp-anchor-$remote_alias"
+    chain_name="chain-mtcp-$remote_alias"
+
+    # 共享主进程允许保持运行；目标线路自己的控制单元和旧版独立主进程必须先停。
+    ensure_units_inactive "CN 线路 $remote_alias" "$watchdog_unit" "$anchor_unit"
+    if [[ "$legacy_main_unit" != "$main_unit" ]]; then
+        ensure_units_inactive "旧版 CN 线路 $remote_alias" "$legacy_main_unit"
+    fi
+    mkdir -p "$state_dir"
 
     while :; do
         prompt_read remote_ip "Remote IPv4 地址: " || die "未输入 Remote IPv4 地址"
         valid_ipv4 "$remote_ip" && break
         echo "  无效的 IPv4 地址" >&2
     done
+    remote_ip="$(normalize_ipv4 "$remote_ip")"
     prompt_read remote_port "Remote MTCP 端口 [6600]: " || die "未输入 Remote MTCP 端口"
+    get_mtcp_auth_password auth_password "请输入 Remote 安装时设置的 MTCP 鉴权密码"
     prompt_read business_port "CN 业务监听端口 [12000]: " || die "未输入 CN 业务监听端口"
     prompt_read anchor_port "CN Anchor 监听端口 [12001]: " || die "未输入 CN Anchor 监听端口"
     prompt_read rtt_threshold "RTT 快路阈值（ms）[40]: " || die "未输入 RTT 阈值"
     remote_port="${remote_port:-6600}"; business_port="${business_port:-12000}"
     anchor_port="${anchor_port:-12001}"; rtt_threshold="${rtt_threshold:-40}"
-    valid_port "$remote_port" && valid_port "$business_port" && valid_port "$anchor_port" || die "端口必须为 1-65535"
+    valid_port "$remote_port" && valid_port "$business_port" && valid_port "$anchor_port" || \
+        die "端口必须为 1-65535"
     remote_port=$((10#$remote_port)); business_port=$((10#$business_port)); anchor_port=$((10#$anchor_port))
     [[ "$business_port" != "$anchor_port" ]] || die "业务端口不能与 Anchor 端口相同"
     [[ "$rtt_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "RTT 阈值无效"
-    ensure_cn_port_available "$business_port" "$instance_dir/mtcp.conf" "$main_unit"
-    ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf" "$main_unit"
+
+    # 单进程下 socket 归属依赖 PID + Remote endpoint；相同 DST:PORT 无法安全区分线路。
+    for config in "$cn_dir"/instances/*/mtcp.conf; do
+        [[ -r "$config" && "$config" != "$instance_dir/mtcp.conf" ]] || continue
+        other_dst="$(read_config_value "$config" DST 2>/dev/null || true)"
+        other_port="$(read_config_value "$config" PORT 2>/dev/null || true)"
+        if [[ "$other_dst" == "$remote_ip" && "$other_port" == "$remote_port" ]]; then
+            die "Remote endpoint $remote_ip:$remote_port 已被 $(basename "$(dirname "$config")") 使用；共享进程要求每条线路 endpoint 唯一"
+        fi
+    done
+    ensure_cn_port_available "$business_port" "$instance_dir/mtcp.conf" "$main_unit" "$legacy_main_unit"
+    ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf" "$main_unit" "$legacy_main_unit"
+    require_cn_restart_window "$cn_dir" "$main_unit"
 
     download_gost cn "$cn_dir"
+
+    # 公共脚本先原子更新；compile-config.sh 是所有线路聚合配置的唯一生成器。
+    lib_tmp="$(mktemp "$cn_dir/.mtcp-lib.XXXXXX")"
+    prewarm_tmp="$(mktemp "$cn_dir/.mtcp-prewarm.XXXXXX")"
+    watchdog_tmp="$(mktemp "$cn_dir/.mtcp-watchdog.XXXXXX")"
+    compile_tmp="$(mktemp "$cn_dir/.compile-config.XXXXXX")"
+    CLEANUP_PATHS+=("$lib_tmp" "$prewarm_tmp" "$watchdog_tmp" "$compile_tmp")
+    extract_embedded CN_LIB | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$lib_tmp"
+    extract_embedded CN_PREWARM | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$prewarm_tmp"
+    extract_embedded CN_WATCHDOG | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$watchdog_tmp"
+    extract_embedded CN_COMPILE > "$compile_tmp"
+    chmod 0755 "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp" "$compile_tmp"
+    mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh"
+    mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh"
+    mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh"
+    mv -f "$compile_tmp" "$cn_dir/compile-config.sh"
 
     yaml_template="$(mktemp "$instance_dir/.cn.template.XXXXXX")"
     yaml_tmp="$(mktemp "$instance_dir/.cn.yaml.XXXXXX")"
     conf_tmp="$(mktemp "$instance_dir/.mtcp.conf.XXXXXX")"
-    CLEANUP_PATHS+=("$yaml_template" "$yaml_tmp" "$conf_tmp")
+    auth_tmp="$(mktemp "$instance_dir/.mtcp.auth.XXXXXX")"
+    runtime_tmp="$(mktemp "$cn_dir/.runtime.yaml.XXXXXX")"
+    CLEANUP_PATHS+=("$yaml_template" "$yaml_tmp" "$conf_tmp" "$auth_tmp" "$runtime_tmp")
+    write_mtcp_auth_file "$auth_tmp" "$auth_password"
+
     legacy_unit="$(read_config_value "$cn_dir/mtcp.conf" UNIT 2>/dev/null || true)"
+    if [[ "${PATHLOCK_SOURCE_TREE:-0}" == 1 &&
+          "$(read_config_value "$cn_dir/mtcp.conf" DST 2>/dev/null || true)" == "remote.example.invalid" ]]; then
+        legacy_unit=""
+    fi
     if [[ -r "$instance_dir/cn.yaml" ]]; then
         cp -p "$instance_dir/cn.yaml" "$yaml_template"
-    elif [[ "$legacy_unit" == "$main_unit" && -r "$cn_dir/cn.yaml" ]]; then
+    elif [[ "$legacy_unit" == "$legacy_main_unit" && -r "$cn_dir/cn.yaml" ]]; then
         cp -p "$cn_dir/cn.yaml" "$yaml_template"
-        echo "检测到旧版平铺配置，正在迁移并保留现有 Relay。"
+        echo "检测到旧版平铺配置，正在迁移到共享 GOST 并保留现有 Relay。"
     else
         extract_embedded CN_YAML > "$yaml_template"
     fi
-    awk -v business=":$business_port" \
-        -v anchor="127.0.0.1:$anchor_port" -v remote="$remote_ip:$remote_port" '
-        /^[[:space:]]*-[[:space:]]name:[[:space:]]*tcp-entry[[:space:]]*$/ { target="business" }
-        /^[[:space:]]*-[[:space:]]name:[[:space:]]*mtcp-anchor[[:space:]]*$/ { target="anchor" }
-        /^chains:[[:space:]]*$/ { chains=1 }
-        chains && /^[[:space:]]*addr:[[:space:]]*/ { sub(/addr:.*/, "addr: " remote); chains=0; r++ }
-        target != "" && /^[[:space:]]*addr:[[:space:]]*/ {
-            value=(target == "business" ? business : anchor); sub(/addr:.*/, "addr: " value)
-            if (target == "business") b++; else a++; target=""
-        }
-        { print }
-        END { if (a != 1 || b != 1 || r != 1) exit 42 }
-    ' "$yaml_template" > "$yaml_tmp" || die "CN YAML 结构不符合预期"
 
-    business_ports="$(cn_business_ports "$yaml_tmp")"
+    render_cn_route_yaml "$yaml_template" "$yaml_tmp" "$remote_alias" \
+        "$remote_ip:$remote_port" ":$business_port" "127.0.0.1:$anchor_port" "$auth_file" || \
+        die "CN 线路 fragment 的监听、链或鉴权结构不符合预期"
+
+    business_ports="$(cn_business_ports "$yaml_tmp" "$chain_name" "$anchor_service")"
     [[ " $business_ports " == *" $business_port "* ]] || \
-        die "迁移后的 CN YAML 未包含主业务端口 $business_port"
+        die "迁移后的线路 fragment 未包含主业务端口 $business_port"
     [[ " $business_ports " != *" $anchor_port "* ]] || \
         die "迁移后的业务端口错误包含 Anchor 端口 $anchor_port"
 
-    extract_embedded CN_MTCP_CONF | awk -v main="$main_unit" -v anchor_unit="$anchor_unit" \
+    extract_embedded CN_MTCP_CONF | awk -v route="$remote_alias" -v main="$main_unit" \
+        -v anchor_unit="$anchor_unit" -v watchdog_unit="$watchdog_unit" \
+        -v chain_name="$chain_name" -v anchor_service="$anchor_service" \
         -v remote="$remote_ip" -v remote_port="$remote_port" -v business="$business_port" \
         -v business_ports="$business_ports" -v anchor_port="$anchor_port" \
         -v rtt="$rtt_threshold" -v state="$state_dir" '
         BEGIN {
-            v["UNIT"]=main; v["ANCHOR_UNIT"]=anchor_unit; v["DST"]=remote; v["PORT"]=remote_port
-            v["BUSINESS_PORT"]=business; v["BUSINESS_PORTS"]=business_ports; v["ANCHOR_HOST"]="127.0.0.1"
-            v["ANCHOR_PORT"]=anchor_port; v["ACCEPT_RTT_MS"]=rtt; v["STATE_DIR"]=state
+            v["ROUTE_ID"]=route; v["UNIT"]=main; v["ANCHOR_UNIT"]=anchor_unit
+            v["WATCHDOG_UNIT"]=watchdog_unit; v["CHAIN_NAME"]=chain_name
+            v["ANCHOR_SERVICE"]=anchor_service; v["DST"]=remote; v["PORT"]=remote_port
+            v["BUSINESS_PORT"]=business; v["BUSINESS_PORTS"]=business_ports
+            v["ANCHOR_HOST"]="127.0.0.1"; v["ANCHOR_PORT"]=anchor_port
+            v["ACCEPT_RTT_MS"]=rtt; v["STATE_DIR"]=state
             v["STATE_FILE"]=state "/runtime.state"; v["STATUS_JSON"]=state "/status.json"
             v["EVENT_FILE"]=state "/events.jsonl"
         }
         { key=$0; sub(/=.*/, "", key); if (key in v) { print key "=\"" v[key] "\""; seen[key]++; next } print }
         END { for (key in v) if (seen[key] != 1) exit 42 }
-    ' > "$conf_tmp" || die "canonical CN 配置结构不符合预期"
+    ' > "$conf_tmp" || die "canonical CN Watchdog 配置结构不符合预期"
     chmod 0644 "$yaml_tmp" "$conf_tmp"
-    mv -f "$yaml_tmp" "$instance_dir/cn.yaml"; mv -f "$conf_tmp" "$instance_dir/mtcp.conf"
 
-    lib_tmp="$(mktemp "$cn_dir/.mtcp-lib.XXXXXX")"
-    prewarm_tmp="$(mktemp "$cn_dir/.mtcp-prewarm.XXXXXX")"
-    watchdog_tmp="$(mktemp "$cn_dir/.mtcp-watchdog.XXXXXX")"
-    CLEANUP_PATHS+=("$lib_tmp" "$prewarm_tmp" "$watchdog_tmp")
-    extract_embedded CN_LIB | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$lib_tmp"
-    extract_embedded CN_PREWARM | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$prewarm_tmp"
-    extract_embedded CN_WATCHDOG | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$watchdog_tmp"
-    chmod 0755 "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp"
-    mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh"; mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh"
-    mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh"
+    compile_cn_runtime_candidate "$cn_dir" "$instance_dir/cn.yaml" "$yaml_tmp" "$runtime_tmp" || \
+        die "无法生成共享 GOST 配置；请检查线路名称、监听端口和 chain 是否冲突"
+    "$cn_dir/gost" -C "$runtime_tmp" -O yaml >/dev/null || die "共享 GOST 配置未通过 GOST 解析校验"
 
-    main_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}.XXXXXX")"
-    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}-anchor.XXXXXX")"
-    watchdog_unit_tmp="$(mktemp "$SYSTEMD_DIR/.${unit_prefix}-watchdog.XXXXXX")"
+    main_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp.XXXXXX")"
+    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.${route_prefix}-anchor.XXXXXX")"
+    watchdog_unit_tmp="$(mktemp "$SYSTEMD_DIR/.${route_prefix}-watchdog.XXXXXX")"
     CLEANUP_PATHS+=("$main_tmp" "$anchor_tmp" "$watchdog_unit_tmp")
-    extract_embedded CN_MAIN_SERVICE | awk -v cn="$cn_dir" -v wd="$instance_dir" -v yaml="$instance_dir/cn.yaml" '
-        /^WorkingDirectory=/ { print "WorkingDirectory=" wd; next }
+    extract_embedded CN_MAIN_SERVICE | awk -v cn="$cn_dir" -v runtime="$runtime_yaml" '
+        /^WorkingDirectory=/ { print "WorkingDirectory=" cn; next }
         /^ExecStartPre=\/usr\/bin\/test -x / { print "ExecStartPre=/usr/bin/test -x " cn "/gost"; next }
-        /^ExecStartPre=\/usr\/bin\/test -r / { print "ExecStartPre=/usr/bin/test -r " yaml; next }
-        /^ExecStart=/ { print "ExecStart=" cn "/gost -D -C " yaml; next }
+        /^ExecStartPre=\/usr\/bin\/test -r / { print "ExecStartPre=/usr/bin/test -r " runtime; next }
+        /^ExecStart=/ { print "ExecStart=" cn "/gost -D -C " runtime; next }
         { print }
     ' > "$main_tmp"
     extract_embedded CN_ANCHOR_SERVICE | sed \
@@ -495,27 +857,107 @@ install_cn() {
           if (line ~ /^WorkingDirectory=/) line="WorkingDirectory=" wd; print line }
     ' > "$watchdog_unit_tmp"
     chmod 0644 "$main_tmp" "$anchor_tmp" "$watchdog_unit_tmp"
-    mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit"
-    mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit"
-    mv -f "$watchdog_unit_tmp" "$SYSTEMD_DIR/$watchdog_unit"
+
+    backup_dir="$(mktemp -d "$cn_dir/.shared-update.XXXXXX")"
+    CLEANUP_PATHS+=("$backup_dir")
+    backup_one() {
+        local path="$1" key="$2"
+        if [[ -e "$path" || -L "$path" ]]; then
+            cp -p "$path" "$backup_dir/$key"
+            : > "$backup_dir/$key.exists"
+        fi
+    }
+    restore_one() {
+        local path="$1" key="$2"
+        if [[ -e "$backup_dir/$key.exists" ]]; then
+            cp -p "$backup_dir/$key" "$path"
+        else
+            rm -f "$path"
+        fi
+    }
+    backup_one "$instance_dir/cn.yaml" route-yaml
+    backup_one "$instance_dir/mtcp.conf" route-conf
+    backup_one "$auth_file" route-auth
+    backup_one "$runtime_yaml" runtime-yaml
+    backup_one "$SYSTEMD_DIR/$main_unit" main-unit
+    backup_one "$SYSTEMD_DIR/$anchor_unit" anchor-unit
+    backup_one "$SYSTEMD_DIR/$watchdog_unit" watchdog-unit
+
+    echo "正在停止各线路控制单元并重启唯一共享 GOST；现有线路连接会中断。"
+    stop_cn_route_controls "$cn_dir"
+    if ! mv -f "$auth_tmp" "$auth_file" ||
+       ! mv -f "$yaml_tmp" "$instance_dir/cn.yaml" ||
+       ! mv -f "$conf_tmp" "$instance_dir/mtcp.conf" ||
+       ! mv -f "$runtime_tmp" "$runtime_yaml" ||
+       ! mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit" ||
+       ! mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit" ||
+       ! mv -f "$watchdog_unit_tmp" "$SYSTEMD_DIR/$watchdog_unit"; then
+        restore_one "$instance_dir/cn.yaml" route-yaml
+        restore_one "$instance_dir/mtcp.conf" route-conf
+        restore_one "$auth_file" route-auth
+        restore_one "$runtime_yaml" runtime-yaml
+        restore_one "$SYSTEMD_DIR/$main_unit" main-unit
+        restore_one "$SYSTEMD_DIR/$anchor_unit" anchor-unit
+        restore_one "$SYSTEMD_DIR/$watchdog_unit" watchdog-unit
+        "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
+        "$SYSTEMCTL_BIN" restart "$main_unit" >/dev/null 2>&1 || true
+        start_cn_route_watchdogs "$cn_dir" >/dev/null 2>&1 || true
+        die "无法替换共享 CN 配置；已尝试恢复原状态"
+    fi
 
     "$SYSTEMCTL_BIN" daemon-reload
-    "$SYSTEMCTL_BIN" enable "$main_unit" "$watchdog_unit"
-    "$SYSTEMCTL_BIN" restart "$main_unit" "$watchdog_unit"
-    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" || die "$main_unit 启动失败"
-    "$SYSTEMCTL_BIN" is-active --quiet "$watchdog_unit" || die "$watchdog_unit 启动失败"
+    "$SYSTEMCTL_BIN" enable "$main_unit" >/dev/null 2>&1 || true
+    if "$SYSTEMCTL_BIN" restart "$main_unit" && "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" &&
+       start_cn_route_watchdogs "$cn_dir"; then
+        restart_ok=1
+    fi
 
+    if (( restart_ok != 1 )); then
+        echo "共享 GOST 更新失败，正在回滚线路、聚合配置和 systemd unit。" >&2
+        stop_cn_route_controls "$cn_dir"
+        restore_one "$instance_dir/cn.yaml" route-yaml
+        restore_one "$instance_dir/mtcp.conf" route-conf
+        restore_one "$auth_file" route-auth
+        restore_one "$runtime_yaml" runtime-yaml
+        restore_one "$SYSTEMD_DIR/$main_unit" main-unit
+        restore_one "$SYSTEMD_DIR/$anchor_unit" anchor-unit
+        restore_one "$SYSTEMD_DIR/$watchdog_unit" watchdog-unit
+        "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
+        "$SYSTEMCTL_BIN" restart "$main_unit" >/dev/null 2>&1 || true
+        start_cn_route_watchdogs "$cn_dir" >/dev/null 2>&1 || true
+        die "共享 GOST 更新未生效，已尝试恢复原配置"
+    fi
+
+    if [[ "$legacy_main_unit" != "$main_unit" ]]; then
+        "$SYSTEMCTL_BIN" disable "$legacy_main_unit" >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_DIR/$legacy_main_unit"
+        "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [[ "$legacy_unit" == "$legacy_main_unit" ]]; then
+        migration_stamp="$(date +%Y%m%d-%H%M%S)"
+        [[ -f "$cn_dir/cn.yaml" ]] && mv -f "$cn_dir/cn.yaml" "$cn_dir/cn.yaml.migrated.$migration_stamp"
+        [[ -f "$cn_dir/mtcp.conf" ]] && mv -f "$cn_dir/mtcp.conf" "$cn_dir/mtcp.conf.migrated.$migration_stamp"
+        if [[ "${PATHLOCK_SOURCE_TREE:-0}" == 1 ]]; then
+            extract_embedded CN_YAML > "$cn_dir/cn.yaml"
+            extract_embedded CN_MTCP_CONF > "$cn_dir/mtcp.conf"
+            chmod 0644 "$cn_dir/cn.yaml" "$cn_dir/mtcp.conf"
+        fi
+    fi
+
+    exec 8>&-
     cat <<DONE
 
 ============================================================
-  CN 端安装完成
+  CN 线路安装完成（共享单 GOST 进程）
 ============================================================
-线路: $remote_alias    Remote: $remote_ip:$remote_port
+线路: $remote_alias    Remote: $remote_ip:$remote_port    MTCP 鉴权: 已启用
 业务端口: $business_port    RTT 阈值: ${rtt_threshold}ms
-配置: $instance_dir/cn.yaml, $instance_dir/mtcp.conf
-状态: $state_dir/status.json
-服务: $main_unit, $watchdog_unit
-Relay 管理: CN_INSTANCE=$remote_alias bash standalone-install.sh relay
+线路 fragment: $instance_dir/cn.yaml
+共享运行配置: $runtime_yaml
+鉴权文件: ${auth_file}（权限 0600）
+共享服务: $main_unit
+线路控制: $anchor_unit, $watchdog_unit
+后续管理: bash standalone-install.sh（选择“管理线路端口转发”）
 ============================================================
 DONE
 }
@@ -585,33 +1027,180 @@ cn_relay_rows() {
     ' "$yaml"
 }
 
+discover_cn_routes() {
+    local config yaml dst
+    DISCOVERED_CN_YAMLS=()
+    DISCOVERED_CN_CONFIGS=()
+
+    for config in "$INSTALL_BASE"/cn/instances/*/mtcp.conf; do
+        [[ -r "$config" ]] || continue
+        yaml="$(dirname "$config")/cn.yaml"
+        [[ -r "$yaml" ]] || continue
+        DISCOVERED_CN_YAMLS+=("$yaml")
+        DISCOVERED_CN_CONFIGS+=("$config")
+    done
+
+    # 只有没有新版 instance 时才展示旧平铺布局，避免迁移后误改归档前的旧配置。
+    if (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
+        for yaml in "$INSTALL_BASE/cn/cn.yaml" "$INSTALL_BASE/cn.yaml"; do
+            [[ -r "$yaml" ]] || continue
+            config="$(dirname "$yaml")/mtcp.conf"
+            [[ -r "$config" ]] || continue
+            dst="$(read_config_value "$config" DST 2>/dev/null || true)"
+            [[ "$dst" != "remote.example.invalid" ]] || continue
+            DISCOVERED_CN_YAMLS+=("$yaml")
+            DISCOVERED_CN_CONFIGS+=("$config")
+            break
+        done
+    fi
+}
+
+cn_route_state_summary() {
+    local config="$1" status_file line state reason
+    status_file="$(read_config_value "$config" STATUS_JSON 2>/dev/null || true)"
+    [[ -n "$status_file" ]] || status_file="$(dirname "$config")/state/status.json"
+    if [[ ! -r "$status_file" ]]; then
+        printf '未生成'
+        return
+    fi
+    line="$(tail -n 1 "$status_file" 2>/dev/null || true)"
+    state="$(printf '%s\n' "$line" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    reason="$(printf '%s\n' "$line" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+    [[ -n "$state" ]] || state="UNKNOWN"
+    if [[ -n "$reason" ]]; then printf '%s/%s' "$state" "$reason"; else printf '%s' "$state"; fi
+}
+
+list_installed_configurations() {
+    local remote_yaml remote_addr index yaml config route dst port ports state
+    local chain anchor primary name listen backend service_chain kind count
+
+    echo
+    echo "================ 已有配置与端口路径 ================"
+    remote_yaml="$INSTALL_BASE/remote/remote.yaml"
+    if [[ -r "$remote_yaml" ]]; then
+        remote_addr="$(awk '
+            /^- name:[[:space:]]*mtcp-server[[:space:]]*$/ { found=1; next }
+            found && /^  addr:[[:space:]]*/ { value=$0; sub(/^  addr:[[:space:]]*/, "", value); print value; exit }
+            found && /^- name:[[:space:]]*/ { exit }
+        ' "$remote_yaml")"
+        echo
+        echo "Remote 端"
+        echo "  MTCP 监听 : ${remote_addr:-未知}"
+        echo "  配置文件  : $remote_yaml"
+        echo "  鉴权文件  : $INSTALL_BASE/remote/mtcp.auth"
+    else
+        echo
+        echo "Remote 端：未发现已安装配置"
+    fi
+
+    discover_cn_routes
+    if (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
+        echo
+        echo "CN 线路：未发现已安装配置"
+        echo "======================================================"
+        echo
+        return 0
+    fi
+
+    echo
+    echo "CN 线路（共享服务: gost-mtcp.service）"
+    for (( index=0; index<${#DISCOVERED_CN_YAMLS[@]}; index++ )); do
+        yaml="${DISCOVERED_CN_YAMLS[$index]}"
+        config="${DISCOVERED_CN_CONFIGS[$index]}"
+        route="$(read_config_value "$config" ROUTE_ID 2>/dev/null || true)"
+        [[ -n "$route" ]] || route="$(basename "$(dirname "$config")")"
+        dst="$(read_config_value "$config" DST 2>/dev/null || true)"
+        port="$(read_config_value "$config" PORT 2>/dev/null || true)"
+        ports="$(read_config_value "$config" BUSINESS_PORTS 2>/dev/null || true)"
+        [[ -n "$ports" ]] || ports="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
+        state="$(cn_route_state_summary "$config")"
+        chain="$(read_config_value "$config" CHAIN_NAME 2>/dev/null || true)"
+        anchor="$(read_config_value "$config" ANCHOR_SERVICE 2>/dev/null || true)"
+        primary="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
+
+        printf '\n  [%d] 线路 %s\n' "$((index + 1))" "$route"
+        printf '      Remote    : %s:%s\n' "${dst:-未知}" "${port:-未知}"
+        printf '      业务端口  : %s\n' "${ports:-未知}"
+        printf '      当前状态  : %s\n' "$state"
+        printf '      cn.yaml   : %s\n' "$yaml"
+        printf '      mtcp.conf : %s\n' "$config"
+        printf '      端口路径：\n'
+        count=0
+        while IFS=$'\t' read -r name listen backend service_chain; do
+            [[ -n "$name" ]] || continue
+            if [[ "$name" == "$anchor" ]]; then
+                kind="anchor"
+            elif [[ "$listen" == ":$primary" ]]; then
+                kind="primary"
+            elif [[ "$service_chain" == "$chain" ]]; then
+                kind="relay"
+            else
+                kind="other"
+            fi
+            printf '        %-7s %-22s -> %-28s via %s\n' "$kind" "$listen" "${backend:--}" "${service_chain:--}"
+            count=$((count + 1))
+        done < <(cn_relay_rows "$yaml")
+        (( count > 0 )) || echo "        （未解析到 service）"
+    done
+    echo
+    echo "======================================================"
+    echo
+}
+
+select_cn_route() {
+    local output_yaml_var="$1" output_config_var="$2" title="${3:-请选择 CN 线路}"
+    local choice index config route dst port ports state
+
+    discover_cn_routes
+    if (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
+        echo "未发现已安装的 CN 线路，请先从主菜单执行全新安装。" >&2
+        return 1
+    fi
+
+    echo
+    echo "${title}："
+    for (( index=0; index<${#DISCOVERED_CN_YAMLS[@]}; index++ )); do
+        config="${DISCOVERED_CN_CONFIGS[$index]}"
+        route="$(read_config_value "$config" ROUTE_ID 2>/dev/null || true)"
+        [[ -n "$route" ]] || route="$(basename "$(dirname "$config")")"
+        dst="$(read_config_value "$config" DST 2>/dev/null || true)"
+        port="$(read_config_value "$config" PORT 2>/dev/null || true)"
+        ports="$(read_config_value "$config" BUSINESS_PORTS 2>/dev/null || true)"
+        [[ -n "$ports" ]] || ports="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
+        state="$(cn_route_state_summary "$config")"
+        printf '  %d) %-12s Remote=%s:%s  业务端口=%s  状态=%s\n' \
+            "$((index + 1))" "$route" "${dst:-未知}" "${port:-未知}" "${ports:-未知}" "$state"
+    done
+    echo "  b) 返回"
+
+    while :; do
+        prompt_read choice "请选择线路 [1-${#DISCOVERED_CN_YAMLS[@]}/b]: " || return 1
+        case "$choice" in b|B|back|q|Q) return 1 ;; esac
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DISCOVERED_CN_YAMLS[@]} )); then
+            index=$((choice - 1))
+            printf -v "$output_yaml_var" '%s' "${DISCOVERED_CN_YAMLS[$index]}"
+            printf -v "$output_config_var" '%s' "${DISCOVERED_CN_CONFIGS[$index]}"
+            return 0
+        fi
+        echo "无效选择" >&2
+    done
+}
+
 resolve_cn_relay_context() {
-    if [[ -n "${CN_YAML_PATH:-}" ]]; then
-        CN_RELAY_YAML="$CN_YAML_PATH"
+    local explicit_yaml="${1:-${CN_YAML_PATH:-}}"
+    local explicit_config="${2:-${CN_MTCP_CONFIG_PATH:-}}"
+    if [[ -n "$explicit_yaml" ]]; then
+        CN_RELAY_YAML="$explicit_yaml"
     elif [[ -n "${CN_INSTANCE:-}" ]]; then
         [[ "$CN_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "CN_INSTANCE 无效"
         CN_RELAY_YAML="$INSTALL_BASE/cn/instances/$CN_INSTANCE/cn.yaml"
     else
-        local path
-        local -a candidates=()
-        for path in "$INSTALL_BASE"/cn/instances/*/cn.yaml; do
-            [[ -r "$path" ]] && candidates+=("$path")
-        done
-        if (( ${#candidates[@]} == 1 )); then
-            CN_RELAY_YAML="${candidates[0]}"
-        elif (( ${#candidates[@]} > 1 )); then
-            echo "检测到多条 CN 线路：" >&2
-            for path in "${candidates[@]}"; do echo "  $(basename "$(dirname "$path")")" >&2; done
-            die "请用 CN_INSTANCE=<线路别名> 指定 Relay 管理目标"
-        elif [[ -r "$INSTALL_BASE/cn/cn.yaml" ]]; then
-            # 仅在还没有新版实例时兼容 v1.1 及更早的单目录安装，避免迁移后误改旧文件。
-            CN_RELAY_YAML="$INSTALL_BASE/cn/cn.yaml"
-        else
-            CN_RELAY_YAML="$INSTALL_BASE/cn.yaml"
-        fi
+        discover_cn_routes
+        (( ${#DISCOVERED_CN_YAMLS[@]} == 1 )) || die "无法唯一确定 CN 线路，请从菜单中选择"
+        CN_RELAY_YAML="${DISCOVERED_CN_YAMLS[0]}"
     fi
-    if [[ -n "${CN_MTCP_CONFIG_PATH:-}" ]]; then
-        CN_RELAY_CONFIG="$CN_MTCP_CONFIG_PATH"
+    if [[ -n "$explicit_config" ]]; then
+        CN_RELAY_CONFIG="$explicit_config"
     else
         CN_RELAY_CONFIG="$(dirname "$CN_RELAY_YAML")/mtcp.conf"
     fi
@@ -619,21 +1208,39 @@ resolve_cn_relay_context() {
     [[ -r "$CN_RELAY_YAML" ]] || die "CN 配置不存在: $CN_RELAY_YAML"
     [[ -r "$CN_RELAY_CONFIG" ]] || die "CN Watchdog 配置不存在: $CN_RELAY_CONFIG"
 
+    CN_ROUTE_ID="$(read_config_value "$CN_RELAY_CONFIG" ROUTE_ID)"
     CN_RELAY_UNIT="$(read_config_value "$CN_RELAY_CONFIG" UNIT)"
+    CN_RELAY_WATCHDOG_UNIT="$(read_config_value "$CN_RELAY_CONFIG" WATCHDOG_UNIT)"
+    CN_RELAY_CHAIN_NAME="$(read_config_value "$CN_RELAY_CONFIG" CHAIN_NAME)"
+    CN_RELAY_ANCHOR_SERVICE="$(read_config_value "$CN_RELAY_CONFIG" ANCHOR_SERVICE)"
     CN_PRIMARY_PORT="$(read_config_value "$CN_RELAY_CONFIG" BUSINESS_PORT)"
     CN_ANCHOR_PORT="$(read_config_value "$CN_RELAY_CONFIG" ANCHOR_PORT)"
+    CN_ROOT="$INSTALL_BASE/cn"
+    CN_RUNTIME_YAML="$CN_ROOT/runtime.yaml"
+    CN_COMPILE_SCRIPT="$CN_ROOT/compile-config.sh"
+    [[ "$CN_ROUTE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || \
+        die "mtcp.conf 中 ROUTE_ID 无效"
     [[ "$CN_RELAY_UNIT" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || \
         die "mtcp.conf 中 UNIT 无效: ${CN_RELAY_UNIT:-<空>}"
+    [[ "$CN_RELAY_WATCHDOG_UNIT" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || \
+        die "mtcp.conf 中 WATCHDOG_UNIT 无效"
+    [[ "$CN_RELAY_CHAIN_NAME" =~ ^chain-mtcp-[A-Za-z0-9_-]+$ ]] || \
+        die "mtcp.conf 中 CHAIN_NAME 无效"
+    [[ "$CN_RELAY_ANCHOR_SERVICE" =~ ^mtcp-anchor-[A-Za-z0-9_-]+$ ]] || \
+        die "mtcp.conf 中 ANCHOR_SERVICE 无效"
     valid_port "$CN_PRIMARY_PORT" || die "mtcp.conf 中 BUSINESS_PORT 无效"
     valid_port "$CN_ANCHOR_PORT" || die "mtcp.conf 中 ANCHOR_PORT 无效"
+    [[ -x "$CN_COMPILE_SCRIPT" ]] || die "共享配置编译器不存在: $CN_COMPILE_SCRIPT"
     "$SYSTEMCTL_BIN" cat "$CN_RELAY_UNIT" >/dev/null 2>&1 || \
         die "systemd unit 不存在: ${CN_RELAY_UNIT}（请先修正 mtcp.conf 的 UNIT）"
 }
 
 cn_business_ports() {
-    local yaml="$1" name listen backend chain port ports="" seen=" "
+    local yaml="$1" wanted_chain="${2:-${CN_RELAY_CHAIN_NAME:-chain-mtcp-default}}"
+    local anchor_service="${3:-${CN_RELAY_ANCHOR_SERVICE:-mtcp-anchor-default}}"
+    local name listen backend chain port ports="" seen=" "
     while IFS=$'\t' read -r name listen backend chain; do
-        [[ "$name" != "mtcp-anchor" && "$chain" == "chain-mtcp" ]] || continue
+        [[ "$name" != "$anchor_service" && "$chain" == "$wanted_chain" ]] || continue
         [[ "$listen" =~ ^:([0-9]+)$ ]] || continue
         port="${BASH_REMATCH[1]}"
         valid_port "$port" || continue
@@ -651,11 +1258,11 @@ list_cn_relays() {
         "----------------------------" "-------"
     while IFS=$'\t' read -r name listen backend chain; do
         [[ -n "$name" ]] || continue
-        if [[ "$name" == "mtcp-anchor" || "$listen" == "127.0.0.1:$CN_ANCHOR_PORT" ]]; then
+        if [[ "$name" == "$CN_RELAY_ANCHOR_SERVICE" || "$listen" == "127.0.0.1:$CN_ANCHOR_PORT" ]]; then
             kind="anchor"
         elif [[ "$listen" == ":$CN_PRIMARY_PORT" ]]; then
             kind="primary"
-        elif [[ "$chain" == "chain-mtcp" ]]; then
+        elif [[ "$chain" == "$CN_RELAY_CHAIN_NAME" ]]; then
             kind="relay"
         else
             kind="other"
@@ -689,24 +1296,28 @@ validate_cn_relay_yaml() {
         [[ "$seen_listens" != *$'\n'"$listen"$'\n'* ]] || return 1
         seen_names+="$name"$'\n'
         seen_listens+="$listen"$'\n'
-        [[ "$name" == "mtcp-anchor" ]] && anchor_count=$((anchor_count + 1))
+        [[ "$name" == "$CN_RELAY_ANCHOR_SERVICE" ]] && anchor_count=$((anchor_count + 1))
         [[ "$listen" == ":$CN_PRIMARY_PORT" ]] && primary_count=$((primary_count + 1))
-        if [[ "$chain" == "chain-mtcp" && -z "$backend" ]]; then return 1; fi
+        if [[ "$chain" == "$CN_RELAY_CHAIN_NAME" && -z "$backend" ]]; then return 1; fi
     done < <(cn_relay_rows "$yaml")
 
     (( anchor_count == 1 && primary_count == 1 )) || return 1
-    grep -Eq '^- name:[[:space:]]*chain-mtcp[[:space:]]*$' "$yaml"
+    grep -Fqx -- "- name: $CN_RELAY_CHAIN_NAME" "$yaml"
 }
 
 apply_cn_relay_yaml() {
     local candidate="$1" action="$2" backup failed config_backup config_failed
-    local config_candidate ports stamp restart_ok=0
+    local runtime_candidate runtime_backup runtime_failed config_candidate ports stamp restart_ok=0
+
+    CLEANUP_PATHS+=("$candidate")
+    exec 8>"$CN_ROOT/config.lock"
+    flock -n 8 || { rm -f "$candidate"; die "另一项 CN 配置操作正在进行"; }
     if ! validate_cn_relay_yaml "$candidate"; then
         rm -f "$candidate"
-        die "生成的 cn.yaml 未通过结构检查，原配置未修改"
+        die "生成的线路 fragment 未通过结构检查，原配置未修改"
     fi
 
-    ports="$(cn_business_ports "$candidate")"
+    ports="$(cn_business_ports "$candidate" "$CN_RELAY_CHAIN_NAME" "$CN_RELAY_ANCHOR_SERVICE")"
     [[ " $ports " == *" $CN_PRIMARY_PORT "* ]] || {
         rm -f "$candidate"
         die "生成的 BUSINESS_PORTS 未包含主业务端口，原配置未修改"
@@ -715,53 +1326,80 @@ apply_cn_relay_yaml() {
         rm -f "$candidate"
         die "生成的 BUSINESS_PORTS 错误包含 Anchor 端口，原配置未修改"
     }
+
     config_candidate="$(mktemp "$CN_RELAY_DIR/.mtcp.conf.relay.XXXXXX")"
+    runtime_candidate="$(mktemp "$CN_ROOT/.runtime.yaml.relay.XXXXXX")"
+    CLEANUP_PATHS+=("$config_candidate" "$runtime_candidate")
     if ! awk -v ports="$ports" '
         /^BUSINESS_PORTS=/ { print "BUSINESS_PORTS=\"" ports "\""; updated=1; next }
         { print }
         END { if (!updated) print "BUSINESS_PORTS=\"" ports "\"" }
     ' "$CN_RELAY_CONFIG" > "$config_candidate"; then
-        rm -f "$candidate" "$config_candidate"
+        rm -f "$candidate" "$config_candidate" "$runtime_candidate"
         die "无法生成 BUSINESS_PORTS 配置，原配置未修改"
     fi
+    if ! compile_cn_runtime_candidate "$CN_ROOT" "$CN_RELAY_YAML" "$candidate" "$runtime_candidate" ||
+       ! "$CN_ROOT/gost" -C "$runtime_candidate" -O yaml >/dev/null; then
+        rm -f "$candidate" "$config_candidate" "$runtime_candidate"
+        die "聚合配置校验失败；可能存在跨线路服务名、端口或 chain 冲突"
+    fi
+    require_cn_restart_window "$CN_ROOT" "$CN_RELAY_UNIT"
 
     stamp="$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
     backup="${CN_RELAY_YAML}.bak.$stamp"
     failed="${CN_RELAY_YAML}.failed.$stamp"
     config_backup="${CN_RELAY_CONFIG}.bak.$stamp"
     config_failed="${CN_RELAY_CONFIG}.failed.$stamp"
+    runtime_backup="${CN_RUNTIME_YAML}.bak.$stamp"
+    runtime_failed="${CN_RUNTIME_YAML}.failed.$stamp"
     cp -p "$CN_RELAY_YAML" "$backup"
     cp -p "$CN_RELAY_CONFIG" "$config_backup"
-    chmod 0644 "$candidate" "$config_candidate"
-    if ! mv -f "$candidate" "$CN_RELAY_YAML" || ! mv -f "$config_candidate" "$CN_RELAY_CONFIG"; then
+    [[ -f "$CN_RUNTIME_YAML" ]] && cp -p "$CN_RUNTIME_YAML" "$runtime_backup"
+    chmod 0644 "$candidate" "$config_candidate" "$runtime_candidate"
+    stop_cn_route_controls "$CN_ROOT"
+
+    if ! mv -f "$candidate" "$CN_RELAY_YAML" ||
+       ! mv -f "$config_candidate" "$CN_RELAY_CONFIG" ||
+       ! mv -f "$runtime_candidate" "$CN_RUNTIME_YAML"; then
         cp -p "$backup" "$CN_RELAY_YAML" >/dev/null 2>&1 || true
         cp -p "$config_backup" "$CN_RELAY_CONFIG" >/dev/null 2>&1 || true
-        rm -f "$candidate" "$config_candidate"
-        die "无法同时替换 cn.yaml 与 mtcp.conf；已尝试恢复原配置"
+        [[ -f "$runtime_backup" ]] && cp -p "$runtime_backup" "$CN_RUNTIME_YAML"
+        rm -f "$candidate" "$config_candidate" "$runtime_candidate"
+        start_cn_route_watchdogs "$CN_ROOT" >/dev/null 2>&1 || true
+        die "无法原子替换线路与聚合配置；已尝试恢复"
     fi
 
-    echo "正在重启 ${CN_RELAY_UNIT}；现有业务连接会中断并由 Watchdog 重新 Prewarm。"
-    if "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT"; then
-        sleep 1
-        if "$SYSTEMCTL_BIN" is-active --quiet "$CN_RELAY_UNIT"; then
-            restart_ok=1
-        fi
+    echo "正在重启共享 ${CN_RELAY_UNIT}；所有线路现有连接会中断并重新 Prewarm。"
+    if "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT" &&
+       "$SYSTEMCTL_BIN" is-active --quiet "$CN_RELAY_UNIT" &&
+       start_cn_route_watchdogs "$CN_ROOT"; then
+        restart_ok=1
     fi
 
     if (( restart_ok == 1 )); then
+        exec 8>&-
         echo "✓ $action"
         echo "Watchdog BUSINESS_PORTS 已同步为: $ports"
-        echo "备份: $backup, $config_backup"
+        echo "聚合配置已更新: $CN_RUNTIME_YAML"
+        echo "备份: $backup, $config_backup, $runtime_backup"
         return 0
     fi
 
-    echo "GOST 重启失败，正在回滚 $CN_RELAY_YAML" >&2
+    echo "共享 GOST 重启失败，正在回滚线路与聚合配置。" >&2
     cp -p "$CN_RELAY_YAML" "$failed"
     cp -p "$CN_RELAY_CONFIG" "$config_failed"
+    cp -p "$CN_RUNTIME_YAML" "$runtime_failed"
     cp -p "$backup" "$CN_RELAY_YAML"
     cp -p "$config_backup" "$CN_RELAY_CONFIG"
+    if [[ -f "$runtime_backup" ]]; then
+        cp -p "$runtime_backup" "$CN_RUNTIME_YAML"
+    else
+        rm -f "$CN_RUNTIME_YAML"
+    fi
     "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT" >/dev/null 2>&1 || true
-    die "Relay 修改未生效；YAML 与 mtcp.conf 均已回滚。失败配置: $failed, $config_failed"
+    start_cn_route_watchdogs "$CN_ROOT" >/dev/null 2>&1 || true
+    exec 8>&-
+    die "Relay 修改未生效；已回滚。失败配置: $failed, $config_failed, $runtime_failed"
 }
 
 add_cn_relay() {
@@ -782,12 +1420,13 @@ add_cn_relay() {
         validate_backend_addr "$backend" && break
         echo "后端地址格式无效，请使用 host:port 或 [IPv6]:port。" >&2
     done
-    default_name="relay-$listen_port"
+    default_name="relay-$CN_ROUTE_ID-$listen_port"
     prompt_read service_name "Relay 服务名 [$default_name]: " || die "未输入服务名"
     service_name="${service_name:-$default_name}"
     [[ "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
         die "服务名只能包含字母、数字、下划线和连字符"
-    [[ "$service_name" != "mtcp-anchor" ]] || die "mtcp-anchor 是保留服务名"
+    [[ "$service_name" != "$CN_RELAY_ANCHOR_SERVICE" ]] || \
+        die "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
 
     while IFS=$'\t' read -r existing_name existing_listen existing_backend existing_chain; do
         [[ "$existing_name" != "$service_name" ]] || die "服务名已存在: $service_name"
@@ -797,20 +1436,21 @@ add_cn_relay() {
         die "本机端口已被其他进程监听: $listen_port"
     fi
 
-    echo "将增加: :$listen_port -> ${backend}（service=${service_name}，共用 chain-mtcp）"
+    echo "将增加: :$listen_port -> ${backend}（service=${service_name}，共用 ${CN_RELAY_CHAIN_NAME}）"
     prompt_read confirm "确认修改并重启 ${CN_RELAY_UNIT}？[y/N]: " || die "操作已取消"
     case "$confirm" in y|Y|yes|YES) ;; *) echo "已取消。"; return 0 ;; esac
 
     candidate="$(mktemp "$CN_RELAY_DIR/.cn.yaml.relay.XXXXXX")"
     if ! awk -v relay_name="$service_name" -v listen_port="$listen_port" \
-        -v backend_name="backend-$listen_port" -v backend_addr="$backend" '
+        -v backend_name="backend-$listen_port" -v backend_addr="$backend" \
+        -v chain_name="$CN_RELAY_CHAIN_NAME" -v anchor_service="$CN_RELAY_ANCHOR_SERVICE" '
         function emit_relay() {
             print "# standalone-relay: " relay_name
             print "- name: " relay_name
             print "  addr: :" listen_port
             print "  handler:"
             print "    type: tcp"
-            print "    chain: chain-mtcp"
+            print "    chain: " chain_name
             print "  listener:"
             print "    type: tcp"
             print "  forwarder:"
@@ -819,7 +1459,7 @@ add_cn_relay() {
             print "      addr: " backend_addr
             print ""
         }
-        /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
+        $0 == "- name: " anchor_service && !inserted {
             emit_relay()
             inserted = 1
         }
@@ -827,7 +1467,7 @@ add_cn_relay() {
         END { if (!inserted) exit 42 }
     ' "$CN_RELAY_YAML" > "$candidate"; then
         rm -f "$candidate"
-        die "没有找到 mtcp-anchor，拒绝修改未知结构的 cn.yaml"
+        die "没有找到 ${CN_RELAY_ANCHOR_SERVICE}，拒绝修改未知结构的线路 fragment"
     fi
     apply_cn_relay_yaml "$candidate" "已增加 :$listen_port -> $backend"
 }
@@ -837,9 +1477,9 @@ remove_cn_relay() {
     local -a candidates=()
 
     while IFS=$'\t' read -r name listen backend chain; do
-        [[ "$name" == "mtcp-anchor" || "$listen" == ":$CN_PRIMARY_PORT" || \
+        [[ "$name" == "$CN_RELAY_ANCHOR_SERVICE" || "$listen" == ":$CN_PRIMARY_PORT" || \
            "$listen" == "127.0.0.1:$CN_ANCHOR_PORT" ]] && continue
-        [[ "$chain" == "chain-mtcp" ]] || continue
+        [[ "$chain" == "$CN_RELAY_CHAIN_NAME" ]] || continue
         candidates+=("$name"$'\t'"$listen"$'\t'"$backend"$'\t'"$chain")
     done < <(cn_relay_rows "$CN_RELAY_YAML")
     (( ${#candidates[@]} > 0 )) || die "没有可删除的额外 Relay"
@@ -894,10 +1534,20 @@ remove_cn_relay() {
 }
 
 manage_cn_relays() {
-    local action="${1:-}" target="${2:-}" choice
+    local action="${1:-}" target="${2:-}" route_yaml="${3:-}" route_config="${4:-}" choice
     check_command awk
     check_command "$SYSTEMCTL_BIN"
-    resolve_cn_relay_context
+
+    if [[ -z "$route_yaml" && -z "${CN_YAML_PATH:-}" && -z "${CN_INSTANCE:-}" ]]; then
+        discover_cn_routes
+        if (( ${#DISCOVERED_CN_YAMLS[@]} > 1 )); then
+            select_cn_route route_yaml route_config "请选择要管理端口转发的线路" || return 0
+        elif (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
+            echo "未发现已安装的 CN 线路，请先执行全新安装。" >&2
+            return 1
+        fi
+    fi
+    resolve_cn_relay_context "$route_yaml" "$route_config"
 
     case "$action" in
         list) list_cn_relays ;;
@@ -905,19 +1555,21 @@ manage_cn_relays() {
         remove|delete|rm) remove_cn_relay "$target" ;;
         "")
             while :; do
+                echo
+                echo "当前线路: $CN_ROUTE_ID    配置: $CN_RELAY_YAML"
                 list_cn_relays
                 cat <<'RELAY_MENU'
-  1) 增加 Relay
-  2) 删除 Relay
+  1) 增加端口转发
+  2) 删除端口转发
   3) 刷新列表
-  q) 返回
+  b) 返回线路选择
 RELAY_MENU
-                prompt_read choice "请选择 [1/2/3/q]: " || return 0
+                prompt_read choice "请选择 [1/2/3/b]: " || return 0
                 case "$choice" in
                     1) add_cn_relay ;;
                     2) remove_cn_relay ;;
                     3) ;;
-                    q|Q|quit|exit) return 0 ;;
+                    b|B|back|q|Q|quit|exit) return 0 ;;
                     *) echo "无效选择" >&2 ;;
                 esac
             done
@@ -926,8 +1578,103 @@ RELAY_MENU
     esac
 }
 
+manage_selected_cn_route() {
+    local route_yaml route_config
+    while :; do
+        route_yaml=""; route_config=""
+        select_cn_route route_yaml route_config "请选择要管理端口转发的线路" || return 0
+        manage_cn_relays "" "" "$route_yaml" "$route_config"
+    done
+}
+
+view_cn_route_logs() {
+    local route_yaml route_config route event_file status_file choice
+    select_cn_route route_yaml route_config "请选择要查看日志的线路" || return 0
+    route="$(read_config_value "$route_config" ROUTE_ID 2>/dev/null || true)"
+    [[ -n "$route" ]] || route="$(basename "$(dirname "$route_config")")"
+    event_file="$(read_config_value "$route_config" EVENT_FILE 2>/dev/null || true)"
+    status_file="$(read_config_value "$route_config" STATUS_JSON 2>/dev/null || true)"
+    [[ -n "$event_file" ]] || event_file="$(dirname "$route_config")/state/events.jsonl"
+    [[ -n "$status_file" ]] || status_file="$(dirname "$route_config")/state/status.json"
+
+    while :; do
+        cat <<LOG_MENU
+
+线路 $route 的运行记录：
+  JSONL 日志 : $event_file
+  状态快照   : $status_file
+
+  1) 查看最近 50 条 JSONL 日志
+  2) 实时跟踪 JSONL 日志（Ctrl-C 停止）
+  3) 查看当前状态 JSON
+  b) 返回主菜单
+LOG_MENU
+        prompt_read choice "请选择 [1/2/3/b]: " || return 0
+        case "$choice" in
+            1)
+                if [[ -r "$event_file" ]]; then
+                    echo; tail -n 50 "$event_file"; echo
+                else
+                    echo "日志尚未生成: $event_file" >&2
+                fi
+                ;;
+            2)
+                if [[ -r "$event_file" ]]; then
+                    echo "正在跟踪 ${event_file}，按 Ctrl-C 返回。"
+                    tail -n 20 -f "$event_file" || true
+                else
+                    echo "日志尚未生成: $event_file" >&2
+                fi
+                ;;
+            3)
+                if [[ -r "$status_file" ]]; then
+                    echo; tail -n 1 "$status_file"; echo
+                else
+                    echo "状态尚未生成: $status_file" >&2
+                fi
+                ;;
+            b|B|back|q|Q|quit|exit) return 0 ;;
+            *) echo "无效选择" >&2 ;;
+        esac
+    done
+}
+
+interactive_main_menu() {
+    local choice install_role
+    while :; do
+        cat <<'MAIN_MENU'
+
+请选择操作：
+
+  1) 全新安装 CN 端 / Remote 端
+  2) 列出已有配置和端口路径
+  3) 选择一个 CN 线路，增删端口转发
+  4) 查看线路 JSONL 日志
+  q) 退出
+MAIN_MENU
+        prompt_read choice "请选择 [1/2/3/4/q]: " || return 0
+        case "$choice" in
+            1)
+                install_role=""
+                if select_install_role install_role; then
+                    case "$install_role" in
+                        cn) install_cn ;;
+                        remote) install_remote ;;
+                    esac
+                fi
+                ;;
+            2) list_installed_configurations ;;
+            3) manage_selected_cn_route ;;
+            4) view_cn_route_logs ;;
+            q|Q|quit|exit) echo "已退出。"; return 0 ;;
+            "") ;;
+            *) echo "无效选择" >&2 ;;
+        esac
+    done
+}
+
 main() {
-    local SELECTED_ROLE="" RELAY_ACTION="" RELAY_TARGET=""
+    local selected_mode="" relay_action="" relay_target=""
 
     prepare_embedded_source
 
@@ -941,16 +1688,21 @@ main() {
             exit 0
             ;;
         cn|remote)
-            SELECTED_ROLE="$1"
+            selected_mode="$1"
             ;;
         relay)
-            SELECTED_ROLE="relay"
-            RELAY_ACTION="${2:-}"
-            RELAY_TARGET="${3:-}"
+            selected_mode="relay"
+            relay_action="${2:-}"
+            relay_target="${3:-}"
+            ;;
+        list|configs)
+            selected_mode="list"
+            ;;
+        logs|log)
+            selected_mode="logs"
             ;;
         "")
-            show_banner
-            select_role_interactively
+            selected_mode="menu"
             ;;
         *)
             echo "错误: 无效参数 '$1'" >&2
@@ -961,10 +1713,13 @@ main() {
 
     check_root
 
-    case "$SELECTED_ROLE" in
+    case "$selected_mode" in
+        menu) PATHLOCK_INTERACTIVE_MENU=1; show_banner; interactive_main_menu ;;
         remote) install_remote ;;
         cn) install_cn ;;
-        relay) manage_cn_relays "$RELAY_ACTION" "$RELAY_TARGET" ;;
+        relay) manage_cn_relays "$relay_action" "$relay_target" ;;
+        list) list_installed_configurations ;;
+        logs) view_cn_route_logs ;;
     esac
 }
 
@@ -982,6 +1737,9 @@ services:
   addr: :6600
   handler:
     type: relay
+    # GOST v3.2.6 的 MTCP listener 不消费 listener.auth；
+    # 在 Relay 协议层校验每条 logical stream，未认证请求无法转发。
+    auther: mtcp-auth
   listener:
     type: mtcp
     metadata:
@@ -992,6 +1750,11 @@ services:
       mux.maxFrameSize: 32768
       mux.maxReceiveBuffer: 33554432
       mux.maxStreamBuffer: 4194304
+
+authers:
+- name: mtcp-auth
+  file:
+    path: /root/gost-ecmp-pathlock/remote/mtcp.auth
 
 ### END REMOTE_YAML ###
 
@@ -1039,12 +1802,13 @@ WantedBy=multi-user.target
 ### END REMOTE_ANCHOR_SERVICE ###
 
 ### BEGIN CN_YAML ###
+# pathlock-route: default
 services:
-- name: tcp-entry
+- name: tcp-entry-default
   addr: :12000
   handler:
     type: tcp
-    chain: chain-mtcp
+    chain: chain-mtcp-default
   listener:
     type: tcp
   forwarder:
@@ -1054,11 +1818,11 @@ services:
 
 # 专用 MTCP 锚定入口，仅监听本机。
 # Anchor 会主动发送 1 Byte 触发默认 Relay 首包逻辑，因此共享 connector 保持原始默认行为。
-- name: mtcp-anchor
+- name: mtcp-anchor-default
   addr: 127.0.0.1:12001
   handler:
     type: tcp
-    chain: chain-mtcp
+    chain: chain-mtcp-default
   listener:
     type: tcp
   forwarder:
@@ -1067,14 +1831,17 @@ services:
       addr: 127.0.0.1:12346
 
 chains:
-- name: chain-mtcp
+- name: chain-mtcp-default
   hops:
-  - name: remote
+  - name: remote-default
     nodes:
-    - name: remote-mtcp
+    - name: remote-mtcp-default
       addr: remote.example.invalid:6600
       connector:
         type: relay
+        # 与 Remote handler 的 mtcp-auth 对应；凭据从安装器生成的 0600 文件读取。
+        auth:
+          file: /root/gost-ecmp-pathlock/cn/instances/default/mtcp.auth
       dialer:
         type: mtcp
         metadata:
@@ -1092,9 +1859,14 @@ chains:
 # GOST MTCP Remote v1 configuration
 # watchdog 每轮重新 source，本文件中的阈值修改后无需重启 watchdog。
 
-# ---- systemd / path ----
+# ---- shared GOST / route identity ----
+# 所有线路共享 UNIT 指向的唯一 GOST 进程；Anchor 与 Watchdog 仍按线路隔离。
+ROUTE_ID="default"
 UNIT="gost-ecmp-pathlock.service"
 ANCHOR_UNIT="gost-ecmp-pathlock-anchor.service"
+WATCHDOG_UNIT="gost-ecmp-pathlock-watchdog.service"
+CHAIN_NAME="chain-mtcp-default"
+ANCHOR_SERVICE="mtcp-anchor-default"
 DST="remote.example.invalid"
 PORT="6600"
 BUSINESS_PORT="12000"
@@ -1173,9 +1945,142 @@ RETENTION_SEC="86400"
 
 ### END CN_MTCP_CONF ###
 
+### BEGIN CN_COMPILE ###
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 将每条线路各自的 cn.yaml fragment 合并为一份供唯一 GOST 进程读取的配置。
+# 用法: compile-config.sh OUTPUT ROUTE_FRAGMENT...
+OUTPUT="${1:-}"
+[[ -n "$OUTPUT" ]] || { echo "usage: $0 OUTPUT ROUTE_FRAGMENT..." >&2; exit 2; }
+shift
+(( $# > 0 )) || { echo "at least one route fragment is required" >&2; exit 2; }
+
+seen_routes=" "
+for fragment in "$@"; do
+    [[ -r "$fragment" ]] || { echo "route fragment not readable: $fragment" >&2; exit 1; }
+    route="$(awk '/^# pathlock-route:[[:space:]]*/ { sub(/^# pathlock-route:[[:space:]]*/, ""); print; exit }' "$fragment")"
+    [[ "$route" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || {
+        echo "invalid or missing route marker: $fragment" >&2
+        exit 1
+    }
+    [[ "$seen_routes" != *" $route "* ]] || { echo "duplicate route id: $route" >&2; exit 1; }
+    seen_routes+="$route "
+done
+
+output_dir="$(dirname "$OUTPUT")"
+mkdir -p "$output_dir"
+tmp="$(mktemp "$output_dir/.runtime.yaml.compile.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+emit_section() {
+    local wanted="$1" fragment route
+    shift
+    for fragment in "$@"; do
+        route="$(awk '/^# pathlock-route:[[:space:]]*/ { sub(/^# pathlock-route:[[:space:]]*/, ""); print; exit }' "$fragment")"
+        [[ -n "$route" ]] || { echo "route marker missing: $fragment" >&2; return 1; }
+        printf '  # route: %s\n' "$route"
+        awk -v wanted="$wanted" -v source="$fragment" '
+            /^services:[[:space:]]*$/ { services++; section="services"; next }
+            /^chains:[[:space:]]*$/ { chains++; section="chains"; next }
+            /^[A-Za-z][A-Za-z0-9_.-]*:[[:space:]]*$/ &&
+                $0 !~ /^services:/ && $0 !~ /^chains:/ { section="other" }
+            section == wanted { print }
+            END {
+                if (services != 1 || chains != 1) {
+                    print "invalid route fragment sections: " source > "/dev/stderr"
+                    exit 42
+                }
+            }
+        ' "$fragment"
+    done
+}
+
+{
+    echo "# Generated by cn/compile-config.sh. Do not edit; edit instances/*/cn.yaml instead."
+    echo "services:"
+    emit_section services "$@"
+    echo
+    echo "chains:"
+    emit_section chains "$@"
+} > "$tmp"
+
+# GOST 的 service/chain 名称及监听地址在聚合配置内必须唯一；同时确认每个
+# service 引用的 chain 都存在，避免重启后才暴露拼装错误。
+awk '
+    function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+    }
+    function remember(kind, value, key) {
+        value = trim(value)
+        key = kind SUBSEP value
+        if (value == "" || seen[key]++) {
+            printf "duplicate or empty %s: %s\n", kind, value > "/dev/stderr"
+            failed = 1
+        }
+        return value
+    }
+    /^services:[[:space:]]*$/ { section="services"; next }
+    /^chains:[[:space:]]*$/ { section="chains"; next }
+    section == "services" && /^- name:[[:space:]]*/ {
+        value=$0; sub(/^- name:[[:space:]]*/, "", value)
+        current_service=remember("service", value)
+        service_count++
+        have_listen=0
+        next
+    }
+    section == "services" && current_service != "" && /^  addr:[[:space:]]*/ && !have_listen {
+        value=$0; sub(/^  addr:[[:space:]]*/, "", value); value=trim(value)
+        if (listen_seen[value]++) {
+            printf "duplicate service listen address: %s\n", value > "/dev/stderr"
+            failed = 1
+        }
+        have_listen=1
+        next
+    }
+    section == "services" && /^[[:space:]]+chain:[[:space:]]*/ {
+        value=$0; sub(/^[[:space:]]+chain:[[:space:]]*/, "", value)
+        refs[trim(value)]=1
+        next
+    }
+    section == "chains" && /^- name:[[:space:]]*/ {
+        value=$0; sub(/^- name:[[:space:]]*/, "", value)
+        value=remember("chain", value)
+        chains[value]=1
+        chain_count++
+        next
+    }
+    section == "chains" && /^      addr:[[:space:]]*/ {
+        value=$0; sub(/^      addr:[[:space:]]*/, "", value); value=trim(value)
+        if (remote_seen[value]++) {
+            printf "duplicate Remote endpoint (route isolation would be ambiguous): %s\n", value > "/dev/stderr"
+            failed=1
+        }
+        next
+    }
+    END {
+        if (service_count == 0 || chain_count == 0) failed=1
+        for (name in refs) {
+            if (!(name in chains)) {
+                printf "service references missing chain: %s\n", name > "/dev/stderr"
+                failed=1
+            }
+        }
+        exit failed
+    }
+' "$tmp"
+
+chmod 0644 "$tmp"
+mv -f "$tmp" "$OUTPUT"
+trap - EXIT
+
+### END CN_COMPILE ###
+
 ### BEGIN CN_MAIN_SERVICE ###
 [Unit]
-Description=GOST ECMP PathLock Data Plane
+Description=GOST ECMP PathLock Shared Data Plane
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -1185,8 +2090,8 @@ StartLimitBurst=5
 Type=simple
 WorkingDirectory=/root/gost-ecmp-pathlock/cn
 ExecStartPre=/usr/bin/test -x /root/gost-ecmp-pathlock/cn/gost
-ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/cn.yaml
-ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/cn.yaml
+ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/runtime.yaml
+ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/runtime.yaml
 Restart=always
 RestartSec=2
 TimeoutStopSec=15
@@ -1257,7 +2162,8 @@ set -uo pipefail
 
 CONFIG_DEFAULT="/root/gost-ecmp-pathlock/cn/mtcp.conf"
 CONFIG_KEYS=(
-    UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
+    ROUTE_ID UNIT ANCHOR_UNIT WATCHDOG_UNIT CHAIN_NAME ANCHOR_SERVICE
+    DST PORT BUSINESS_PORT BUSINESS_PORTS ANCHOR_HOST ANCHOR_PORT
     ACCEPT_RTT_MS
     LIVE_RTT_WARN_MS LIVE_RTT_CRIT_MS LIVE_RTT_WARN_HOLD_SEC
     LIVE_RTT_CRIT_HOLD_SEC LIVE_RTT_RECOVER_MS LIVE_RTT_RECOVER_HOLD_SEC
@@ -1285,6 +2191,24 @@ load_config() {
     unset "${CONFIG_KEYS[@]}"
     # shellcheck disable=SC1090
     source "$cfg" || { echo "config invalid: $cfg" >&2; return 1; }
+
+    ROUTE_ID="${ROUTE_ID:-${ANCHOR_UNIT:-route}}"
+    ROUTE_ID="${ROUTE_ID%.service}"
+    ROUTE_ID="${ROUTE_ID//[^A-Za-z0-9_-]/_}"
+    [[ "$ROUTE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
+        echo "invalid ROUTE_ID in config: $cfg" >&2
+        return 1
+    }
+    CHAIN_NAME="${CHAIN_NAME:-chain-mtcp-$ROUTE_ID}"
+    ANCHOR_SERVICE="${ANCHOR_SERVICE:-mtcp-anchor-$ROUTE_ID}"
+    [[ "$CHAIN_NAME" =~ ^chain-mtcp-[A-Za-z0-9_-]+$ ]] || {
+        echo "invalid CHAIN_NAME in config: $cfg" >&2
+        return 1
+    }
+    [[ "$ANCHOR_SERVICE" =~ ^mtcp-anchor-[A-Za-z0-9_-]+$ ]] || {
+        echo "invalid ANCHOR_SERVICE in config: $cfg" >&2
+        return 1
+    }
 
     local required
     for required in UNIT ANCHOR_UNIT DST PORT BUSINESS_PORT ANCHOR_HOST ANCHOR_PORT ACCEPT_RTT_MS; do
@@ -1521,6 +2445,39 @@ wait_outer_gone() {
     return 1
 }
 
+kill_route_outers() {
+    local pid="$1" sport killed=0
+    local -a sports=()
+    (( pid > 0 )) || return 1
+    mapfile -t sports < <(get_gost_outer_sports "$pid")
+    (( ${#sports[@]} > 0 )) || return 1
+    for sport in "${sports[@]}"; do
+        if ss -K "dst ${DST}:${PORT} sport = :${sport}" >/dev/null 2>&1; then
+            killed=$((killed + 1))
+        fi
+    done
+    (( killed == ${#sports[@]} ))
+}
+
+wait_route_sports_gone() {
+    local pid="$1" timeout_sec="$2" deadline current old found
+    shift 2
+    local -a old_sports=("$@") current_sports=()
+    deadline=$((SECONDS + timeout_sec))
+    while (( SECONDS < deadline )); do
+        mapfile -t current_sports < <(get_gost_outer_sports "$pid")
+        found=0
+        for old in "${old_sports[@]}"; do
+            for current in "${current_sports[@]}"; do
+                [[ "$current" == "$old" ]] && found=1
+            done
+        done
+        (( found == 0 )) && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 write_status_json() {
     local state="${1:-UNKNOWN}" reason="${2:-}" pid="${3:-0}" sport="${4:-}"
     local minrtt="${5:-}" rtt="${6:-}" outer="${7:-0}" remote="${8:-unknown}"
@@ -1534,8 +2491,8 @@ write_status_json() {
     process_breaker="${PROCESS_BREAKER_STATE:-closed}"
     if (( apid > 0 && acount == 1 )); then astate="up"; elif (( apid > 0 )); then astate="starting"; else astate="down"; fi
     epoch="$(now_epoch)"; ts="$(now_text)"; tmp="${STATUS_JSON}.tmp.$$"
-    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
-      "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$UNIT")" \
+    printf '{"epoch":%s,"ts":"%s","state":"%s","reason":"%s","route":"%s","unit":"%s","dst":"%s","port":%s,"business_ports":"%s","pid":%s,"outer_count":%s,"sport":"%s","minrtt_ms":"%s","rtt_ms":"%s","remote_reachable":"%s","data_plane_reachable":"%s","data_probe_failures":%s,"data_probe_breaker":"%s","process_breaker":"%s","anchor_unit":"%s","anchor_state":"%s","anchor_pid":%s,"anchor_connections":%s,"business_connections":%s}\n' \
+      "$epoch" "$(json_escape "$ts")" "$(json_escape "$state")" "$(json_escape "$reason")" "$(json_escape "$ROUTE_ID")" "$(json_escape "$UNIT")" \
       "$(json_escape "$DST")" "$PORT" "$(json_escape "$BUSINESS_PORTS")" "${pid:-0}" "${outer:-0}" "$(json_escape "$sport")" "$(json_escape "$minrtt")" "$(json_escape "$rtt")" \
       "$(json_escape "$remote")" "$(json_escape "$data_plane")" "$data_failures" "$(json_escape "$data_breaker")" \
       "$(json_escape "$process_breaker")" "$(json_escape "$ANCHOR_UNIT")" "$astate" \
@@ -1562,9 +2519,9 @@ case "$MODE" in
   *)              MAX_DRAWS="${PREWARM_MAX_DRAWS:-12}" ;;
 esac
 
-LOCK_ID="${UNIT%.service}"
+LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/${LOCK_ID}-prewarm.lock"
+LOCK="/run/gost-pathlock-${LOCK_ID}-prewarm.lock"
 exec {LOCKFD}>"$LOCK"
 flock -n "$LOCKFD" || exit 75
 
@@ -1773,9 +2730,9 @@ PREWARM="${MTCP_PREWARM:-/root/gost-ecmp-pathlock/cn/mtcp-prewarm.sh}"
 source "$LIB"
 load_config "$CONFIG" || exit 1
 
-LOCK_ID="${UNIT%.service}"
+LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/${LOCK_ID}-watchdog.lock"
+LOCK="/run/gost-pathlock-${LOCK_ID}-watchdog.lock"
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
     if (( ADOPT_MODE == 1 )); then
@@ -2024,16 +2981,33 @@ allow_process_recovery() {
 }
 
 recover_process_rate_limited() {
-    local now="$1"
+    local now="$1" shared_id shared_lock
     allow_process_recovery "$now" || return 1
+    shared_id="${UNIT%.service}"
+    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
+    shared_lock="/run/${shared_id}-process-recovery.lock"
+    exec {PROCESS_LOCK_FD}>"$shared_lock"
+    if ! flock -n "$PROCESS_LOCK_FD"; then
+        exec {PROCESS_LOCK_FD}>&-
+        return 1
+    fi
+
+    # 多条线路的 Watchdog 共享同一个 GOST。拿到全局锁后必须复查，避免它们
+    # 在同一轮同时 restart 公共进程。
+    if service_is_active && (( $(get_main_pid) > 0 )); then
+        exec {PROCESS_LOCK_FD}>&-
+        return 0
+    fi
     log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
         "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
     if ! systemctl restart "$UNIT"; then
         log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
+        exec {PROCESS_LOCK_FD}>&-
         return 2
     fi
     log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
+    exec {PROCESS_LOCK_FD}>&-
     return 0
 }
 
@@ -2049,11 +3023,12 @@ set_state() {
         "$DATA_PLANE_OK" "$DATA_PROBE_FAILS"
 }
 
-restart_gost_rate_limited() {
-    local reason="$1" now
+reset_route_rate_limited() {
+    local reason="$1" now pid count
+    local -a old_sports=()
     now="$(now_epoch)"
     if (( LAST_RESTART > 0 && now - LAST_RESTART < ${RESTART_COOLDOWN_SEC:-300} )); then
-        log_event "FAULT" "RESTART_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
+        log_event "FAULT" "ROUTE_RESET_SKIPPED_COOLDOWN" "$reason" "$LAST_PID" "$LAST_SPORT"
         return 1
     fi
     if [[ "$reason" == "DATA_PLANE_STALE_OUTER" ]] && ! allow_data_probe_restart "$now"; then
@@ -2061,13 +3036,26 @@ restart_gost_rate_limited() {
     fi
     LAST_RESTART="$now"
     stop_anchor
-    log_event "FAULT" "RESTART_GOST" "$reason" "$LAST_PID" "$LAST_SPORT"
-    if ! systemctl restart "$UNIT"; then
-        log_event "FAULT" "RESTART_GOST_FAILED" "$reason" "$LAST_PID" "$LAST_SPORT"
-        return 2
+    pid="$(get_main_pid)"
+    count="$(get_gost_outer_count "$pid")"
+    log_event "FAULT" "RESET_ROUTE_OUTER" "$reason" "$pid" "$LAST_SPORT" "" "" \
+        "route=$ROUTE_ID count=$count endpoint=$DST:$PORT"
+
+    # 只关闭本线路唯一 Remote endpoint 对应的 outer；共享 GOST 及其他线路不动。
+    # count=0 时清理状态并让下一轮 Anchor 重新触发拨号，不升级为全局 restart。
+    if (( count > 0 )); then
+        mapfile -t old_sports < <(get_gost_outer_sports "$pid")
+        if ! kill_route_outers "$pid" ||
+           ! wait_route_sports_gone "$pid" "${PREWARM_KILL_WAIT_SEC:-2}" "${old_sports[@]}"; then
+            log_event "FAULT" "RESET_ROUTE_OUTER_FAILED" "$reason" "$pid" "$LAST_SPORT" "" "" \
+                "route=$ROUTE_ID count=$(get_gost_outer_count "$pid")"
+            return 2
+        fi
+    else
+        log_event "DOWN" "RESET_ROUTE_NO_OUTER" "$reason" "$pid" "" "" "" "route=$ROUTE_ID"
     fi
-    (( LAST_PID > 0 )) && LAST_NONZERO_PID="$LAST_PID"
-    LAST_PID=0; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
+
+    LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0
     reset_data_probe_state
     return 0
 }
@@ -2117,7 +3105,7 @@ run_select() {
       *)
         STATE="FAULT"; REASON="PREWARM_RC_${rc}"
         log_event "FAULT" "SELECT_PREWARM_FAILED" "$REASON" "$(get_main_pid)" "" "" "" "cause=$cause"
-        restart_gost_rate_limited "$REASON" || true
+        reset_route_rate_limited "$REASON" || true
         return "$rc"
         ;;
     esac
@@ -2218,7 +3206,7 @@ while true; do
         reset_data_probe_state
         DATA_PLANE_OK="no"
         ((MULTI_SEEN++)); set_state "FAULT" "MULTI_OUTER" "$pid" "" "" "" "$count"
-        if (( MULTI_SEEN >= ${MULTI_CONFIRM_COUNT:-2} )); then restart_gost_rate_limited "MULTI_OUTER" || true; fi
+        if (( MULTI_SEEN >= ${MULTI_CONFIRM_COUNT:-2} )); then reset_route_rate_limited "MULTI_OUTER" || true; fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     else
         MULTI_SEEN=0
@@ -2271,7 +3259,7 @@ while true; do
         fi
 
         if (( ZERO_SINCE > 0 && now - ZERO_SINCE >= ${STUCK_RESTART_AFTER_SEC:-60} )) && [[ "$REMOTE_OK" == "yes" ]]; then
-            restart_gost_rate_limited "REMOTE_UP_BUT_NO_OUTER" || true
+            reset_route_rate_limited "REMOTE_UP_BUT_NO_OUTER" || true
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -2373,7 +3361,7 @@ while true; do
                         log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                             "$pid" "$sport" "$minrtt" "$rtt" \
                             "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                        restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                        reset_route_rate_limited "DATA_PLANE_STALE_OUTER"
                         restart_rc=$?
                         if (( restart_rc == 3 )); then
                             set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1
@@ -2426,7 +3414,7 @@ while true; do
                     log_event "FAULT" "STALE_OUTER_CONFIRMED" "DATA_PLANE" \
                         "$pid" "$sport" "$minrtt" "$rtt" \
                         "data_probe_failures=$DATA_PROBE_FAILS remote_tcp=up"
-                    restart_gost_rate_limited "DATA_PLANE_STALE_OUTER"
+                    reset_route_rate_limited "DATA_PLANE_STALE_OUTER"
                     restart_rc=$?
                     if (( restart_rc == 3 )); then
                         set_state "FAULT" "DATA_PROBE_BREAKER" "$pid" "$sport" "$minrtt" "$rtt" 1

@@ -1,5 +1,5 @@
 [Unit]
-Description=GOST ECMP PathLock Data Plane
+Description=GOST ECMP PathLock Shared Data Plane
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -9,8 +9,8 @@ StartLimitBurst=5
 Type=simple
 WorkingDirectory=/root/gost-ecmp-pathlock/cn
 ExecStartPre=/usr/bin/test -x /root/gost-ecmp-pathlock/cn/gost
-ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/cn.yaml
-ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/cn.yaml
+ExecStartPre=/usr/bin/test -r /root/gost-ecmp-pathlock/cn/runtime.yaml
+ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/runtime.yaml
 Restart=always
 RestartSec=2
 TimeoutStopSec=15

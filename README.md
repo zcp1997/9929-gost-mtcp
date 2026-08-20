@@ -66,7 +66,7 @@ Valid samples: 970 / 1000
 - **Data-plane Probe** 负责验证"这条 outer 是不是真的能用"。`ESTAB` 只说明 socket 还在, 不代表数据面真通; 探测靠一次真实的 payload 收发来确认。
 - **Watchdog** 是最终的控制器。正常状态下它什么都不干, 只有真正探测到故障(GOST crash、outer 消失、outer 变成假活、Remote 整体不可达等)时才出手清理、重建、重新选路。
 
-另外几条原则: 运行中的实时 RTT 只用来告警, 不会因为一次瞬时拥塞就把正在用的连接踢掉; Remote 整体联系不上时安静等待, 不会疯狂重启 GOST 或反复重抽; 任何时候都只保留一条 MTCP outer TCP, 所有业务共享它。
+另外几条原则: 运行中的实时 RTT 只用来告警, 不会因为一次瞬时拥塞就把正在用的连接踢掉; Remote 整体联系不上时安静等待, 不会疯狂重启 GOST 或反复重抽; **每条 Remote 线路**只保留一条 MTCP outer TCP，该线路的所有业务共享它。多条线路则在同一个 GOST 进程内各自维护一条 outer。
 
 一句话总结整个设计:
 
@@ -91,43 +91,64 @@ Valid samples: 970 / 1000
                              | CN recovery control                |                           | requested stream targets       |
                              | Prewarm : draw ECMP by minrtt      |                           | business :2345/:2347/...       |
                              | Anchor  : hold logical stream      |                           | probe echo :12346              |
-                             | Watchdog: PID/outer/RTT/Remote     |
+                             | Watchdog: PID/outer/RTT/Remote     |                           +--------------------------------+
                              | Probe   : 1-byte payload echo      |
                              +------------------------------------+
 ```
 
-业务入口(`:12000` 及后续新增的 relay 端口)统一走 `chain-mtcp`, 共享同一个 MTCP connector 和唯一的 outer, 每个 logical stream 各自带自己的 Remote 目标。Anchor 本机入口是 `127.0.0.1:12001`, 打到 Remote 的 echo endpoint `127.0.0.1:12346`。Data Plane Probe 走的是同一条链路(`12001 → chain-mtcp → 选中的 outer → 12346`), 默认每 15 秒发一个 1 字节 payload 来回验证数据面是否真的通。Remote 侧在 `:6600` 收 outer 里的 logical stream, 再按各自目标转发到 `127.0.0.1:2345`、`:2347` 等业务后端或探测 endpoint。
+单条线路的业务入口(`:12000` 及后续 Relay 端口)统一走该线路的 `chain-mtcp-<线路>`，共享同一个 MTCP connector 和唯一 outer，每个 logical stream 各自带 Remote 目标。不同线路的 service/chain 名称彼此隔离，但都装在同一个 GOST 进程。Anchor 本机入口是 `127.0.0.1:12001`，打到 Remote 的 echo endpoint `127.0.0.1:12346`。Data Plane Probe 默认每 15 秒沿同一条线路发送并收回 1 字节。Remote 收到 logical stream 后先校验 Relay 凭据，再转发到业务后端或探测 endpoint。
 
 ## 快速安装
 
 **推荐: 单文件安装器(不用克隆项目)**
 
 ```bash
-# 1. 先装 Remote(境外服务器)
-curl -fsSL https://raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh | bash -s remote
+# Remote 服务器：下载后打开菜单，选择 1 -> Remote
+curl -fsSL https://raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh \
+  -o /root/standalone-install.sh
+bash /root/standalone-install.sh
 
-# 2. 记下 Remote 的公网 IPv4 和 MTCP 端口(默认 6600)
-
-# 3. 再装 CN(中国大陆服务器)
-curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh | bash -s cn
-# 按提示输入 Remote IP、端口和 RTT 阈值(默认 40ms)
+# CN 服务器：国内使用 ghfast 下载，打开菜单后选择 1 -> CN
+curl -fsSL https://ghfast.top/raw.githubusercontent.com/zcp1997/gost-ecmp-pathlock/main/standalone-install.sh \
+  -o /root/standalone-install.sh
+bash /root/standalone-install.sh
 ```
 
-管道安装会从当前终端读取交互输入, 所以直接在 SSH/终端里跑, 别把 stdin 重定向掉。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的, 安装器会自动去掉它找对应的资产文件名。
+无参数运行就是统一管理菜单：
+
+```text
+1) 全新安装 CN 端 / Remote 端
+2) 列出已有配置和端口路径
+3) 选择一个 CN 线路，增删端口转发
+4) 查看线路 JSONL 日志
+```
+
+安装后继续运行同一条 `bash /root/standalone-install.sh` 即可管理，不需要设置 `CN_INSTANCE`。自动化场景仍可使用 `bash standalone-install.sh remote|cn|relay`。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的，安装器会自动去掉它寻找对应资产文件。
 
 **传统方式(开发/调试用, 能看到完整代码)**
 
 ```bash
-# CN 服务器
-git clone https://ghfast.top/https://github.com/zcp1997/gost-ecmp-pathlock.git
-cd gost-ecmp-pathlock
-bash install.sh cn
-
-# Remote 服务器
+# Remote 服务器（先安装并设置鉴权密码）
 git clone https://github.com/zcp1997/gost-ecmp-pathlock.git
 cd gost-ecmp-pathlock
 bash install.sh remote
+
+# CN 服务器（输入 Remote 上设置的同一密码）
+git clone https://ghfast.top/https://github.com/zcp1997/gost-ecmp-pathlock.git
+cd gost-ecmp-pathlock
+bash install.sh cn
 ```
+
+### MTCP Relay 鉴权
+
+安装器强制要求一个 12-128 位的密码，并在 Remote 的 Relay handler 与 CN 的 Relay connector 之间校验。GOST v3.2.6 的 MTCP listener/dialer 本身不会消费 `listener.auth`/`dialer.auth`，所以鉴权必须放在 Relay 协议层；密码错误或未提供凭据的 logical stream 会被 Remote 拒绝，不能再把 MTCP 端口当成公开 Relay 使用。
+
+凭据不会写进 YAML：安装器使用固定用户名 `mtcp`，把两端凭据分别写入权限为 `0600` 的 `mtcp.auth` 文件。Standalone 默认位置是：
+
+- Remote：`/opt/gost-mtcp/remote/mtcp.auth`
+- CN：`/opt/gost-mtcp/cn/instances/<线路别名>/mtcp.auth`
+
+交互安装会隐藏输入并要求确认。自动化部署可在 Remote 与 CN 安装进程中传入相同的 `MTCP_AUTH_PASSWORD`；避免把它直接写进 shell 历史或日志。已有部署升级时，应先停止对应 unit，再用同一个新密码依次重装 Remote 和所有 CN 线路。
 
 ## 系统要求
 
@@ -164,7 +185,10 @@ ss -lntp | grep ':6600'
 **CN(假设线路别名是 jp):**
 
 ```bash
-systemctl status gost-mtcp-jp.service
+# 全机唯一的 CN GOST 进程
+systemctl status gost-mtcp.service
+
+# jp 线路自己的轻量 Watchdog
 systemctl status gost-mtcp-jp-watchdog.service
 
 # 查看状态
@@ -187,8 +211,8 @@ ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 # 单文件安装器默认路径
 nano /opt/gost-mtcp/cn/instances/jp/cn.yaml
 
-# 或传统方式路径
-nano /root/gost-ecmp-pathlock/cn/cn.yaml
+# 或传统方式路径（传统入口同样使用 instances 布局）
+nano /root/gost-ecmp-pathlock/cn/instances/jp/cn.yaml
 
 # 修改后端地址
 forwarder:
@@ -196,8 +220,12 @@ forwarder:
   - name: backend
     addr: 127.0.0.1:8080  # 改成实际地址
 
-# 重启服务
-systemctl restart gost-mtcp-jp.service
+# 确认所有线路连接都允许中断后，重新生成聚合配置并受控重启
+CN_DIR=/opt/gost-mtcp/cn  # 传统方式改为 /root/gost-ecmp-pathlock/cn
+"$CN_DIR/compile-config.sh" "$CN_DIR/runtime.yaml" "$CN_DIR"/instances/*/cn.yaml
+"$CN_DIR/gost" -C "$CN_DIR/runtime.yaml" -O yaml >/dev/null
+systemctl restart gost-mtcp.service
+systemctl restart 'gost-mtcp-*-watchdog.service'
 ```
 
 **修改 RTT 阈值:**
@@ -216,8 +244,8 @@ systemctl restart gost-mtcp-jp-watchdog.service
 
 Watchdog 默认每 15 秒经本地 Anchor 入口收发 1 字节验证数据面。连续失败 3 次后, 会额外单独建一条 TCP 去探测 Remote 的 MTCP 端口:
 
-- Remote TCP 不可达 → 判定整条链路真断了, 安静等待, 不循环重启 GOST 也不循环重抽
-- Remote TCP 可达 → 判定当前 outer 是 stale 的(连接还在但数据面死了), 限频重启 GOST, 交给 Prewarm 重新选路
+- Remote TCP 不可达 → 判定整条线路真断了, 安静等待, 不循环重启 GOST 也不循环重抽
+- Remote TCP 可达 → 判定该线路当前 outer 是 stale 的, 只关闭该 `DST:PORT` 对应的 outer 并重新 Prewarm；不会重启共享 GOST，也不会碰其他线路
 
 ```bash
 # mtcp.conf 默认值
@@ -230,7 +258,7 @@ DATA_PROBE_RESTART_MAX=3
 DATA_PROBE_BREAKER_OPEN_SEC=600
 ```
 
-把 `DATA_PROBE_ENABLED` 改成 `no` 可以退回旧版行为, 只看 outer 的 TCP 状态。如果探测 endpoint 配错了或者一直失败, 10 分钟内因 stale outer 重启满 3 次就会进 `FAULT/DATA_PROBE_BREAKER`, 停 10 分钟不再重启; 之后只放一次 half-open 试探, 数据面探测成功了才会关闭熔断。
+把 `DATA_PROBE_ENABLED` 改成 `no` 可以退回旧版行为, 只看 outer 的 TCP 状态。如果探测 endpoint 配错了或者一直失败, 10 分钟内线路 outer 重置满 3 次就会进 `FAULT/DATA_PROBE_BREAKER`, 停 10 分钟不再重置; 之后只放一次 half-open 试探, 数据面探测成功了才会关闭熔断。
 
 GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。进程连续健康 60 秒后熔断器自动关闭。
 
@@ -250,12 +278,12 @@ OUTER_DISAPPEARED → REMOTE_TCP_DOWN → DOWN/REMOTE(安静等待)
 
 ```
 outer_count=1; TCP=ESTAB; payload=FAIL → DATA_PROBE_FAILED 1/3 → 2/3 → 3/3
-  → STALE_OUTER_CONFIRMED(remote_tcp=up) → RESTART_GOST → PID_CHANGED
-  → PREWARM_SUCCESS(33.319ms) → ANCHOR_BOUND
+  → STALE_OUTER_CONFIRMED(remote_tcp=up) → RESET_ROUTE_OUTER
+  → RECOVERY_SELECT → PREWARM_SUCCESS → ANCHOR_BOUND
   → FAST(data_plane_reachable=yes, failures=0)
 ```
 
-实测过一次: 旧 PID `40229`、outer sport `21764` 在内核里还显示 `ESTAB`, 但连续探测失败; Watchdog 确认是 stale outer 后自动重启 GOST, 新 PID `46156` 建立 sport `24570`, 以 `minrtt=33.319ms` 恢复到 `FAST`。
+旧版曾通过重启单线路 GOST 验证过这条恢复路径。共享进程架构保留相同的 stale 判定，但恢复动作改为按当前 PID、Remote `DST:PORT` 和 sport 精确关闭该线路 outer；GOST PID 与其他线路保持不变。
 
 这两条路径合起来覆盖了 Remote 真断、outer 消失、outer 还在但数据面已死三种情况。要注意的是: hard failure 发生时已有的业务 TCP 连接没法无缝迁移, 恢复目标是让**后续新连接**尽快可用, 不是保住老连接。
 
@@ -273,30 +301,39 @@ bash standalone-install.sh cn
 # 别名: us, 业务端口: 12002, Anchor: 12003
 ```
 
-每条线路有自己独立的配置和状态, 只共享 GOST 二进制和运行脚本:
+CN 全机只运行一个 `gost-mtcp.service`。每条线路保留独立的 fragment、鉴权、状态、Anchor 和 Watchdog；`compile-config.sh` 将所有线路 fragment 合成唯一的 `runtime.yaml`：
 
 ```text
 /opt/gost-mtcp/cn/
-├── gost, mtcp-lib.sh, mtcp-prewarm.sh, mtcp-watchdog.sh
+├── gost, compile-config.sh
+├── runtime.yaml                         # 唯一 GOST 进程读取的聚合配置
+├── mtcp-lib.sh, mtcp-prewarm.sh, mtcp-watchdog.sh
 └── instances/
-    ├── jp/  -> cn.yaml, mtcp.conf, state/
-    └── us/  -> cn.yaml, mtcp.conf, state/
+    ├── jp/  -> cn.yaml, mtcp.conf, mtcp.auth, state/
+    └── us/  -> cn.yaml, mtcp.conf, mtcp.auth, state/
 ```
 
-安装器不会覆盖正在跑的线路, 避免 GOST 和 Watchdog 读到新旧不一致的配置。重装前先停掉提示里列出的 main、Anchor、Watchdog 三个 unit; Remote 重装也是同样的保护逻辑。
+聚合配置中的对象名按线路隔离，例如 `tcp-entry-jp`、`mtcp-anchor-jp`、`chain-mtcp-jp`。每条线路必须使用唯一的 Remote `IP:port`；否则同一 PID 下无法可靠判断某条 outer 属于哪条线路，安装器和编译器都会拒绝。
+
+新增/重装线路会原子重建并校验 `runtime.yaml`，停止各线路 Anchor/Watchdog，然后只重启一次共享 GOST。这个管理动作会中断所有线路的现有连接；菜单检测到活跃业务时会显示连接数并要求再次明确确认，直接命令或自动化则默认拒绝，需设置 `CN_FORCE_RESTART=1`。运行期间的慢路重抽、stale outer 和单线路恢复只重置对应 Remote endpoint，不重启共享进程。
+
+从旧版多 GOST 部署升级时，逐条停止旧线路并重新执行 `standalone-install.sh cn`。已迁移线路进入共享进程；尚未迁移的旧 fragment 暂不纳入 `runtime.yaml`，直到该线路完成重装。
 
 ### 管理 CN 额外端口 Relay
 
-不用手改 YAML, standalone 安装器自带列出/新增/删除业务入口的功能。新增的 Relay 会和主入口共用同一个 `chain-mtcp` 和唯一的 MTCP outer:
+不用手改 YAML, standalone 安装器自带列出/新增/删除业务入口的功能。新增的 Relay 会和主入口共用目标线路自己的 chain（例如 `chain-mtcp-jp`）和唯一 outer:
 
 ```bash
-# 交互式管理
+# 推荐：进入统一菜单，选择 3，再从编号列表选择线路
+bash standalone-install.sh
+
+# 也可直接进入线路选择器
 bash standalone-install.sh relay
 
-# 或者分项命令
+# 自动化兼容命令；多线路且未指定线路时同样会显示选择器
 bash standalone-install.sh relay list
 bash standalone-install.sh relay add
-bash standalone-install.sh relay remove relay-12002
+bash standalone-install.sh relay remove relay-jp-12002
 ```
 
 比如 `relay add` 后输入:
@@ -304,10 +341,10 @@ bash standalone-install.sh relay remove relay-12002
 ```text
 新增 CN 监听端口: 12002
 Remote 后端地址: 127.0.0.1:2347
-Relay 服务名: relay-12002
+Relay 服务名 [relay-jp-12002]: （回车使用默认值）
 ```
 
-就会生成 `:12002 → chain-mtcp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。`cn.yaml` 和 `mtcp.conf` 是一起备份、一起替换的, GOST 没能正常恢复的话两者一起回滚。Watchdog 用一次 `ss` 快照统计所有业务端口的连接数, 慢路重抽前 Prewarm 还会再确认一遍业务是不是真空闲。主业务端口和 Anchor 端口不能删除或覆盖。
+就会生成 `:12002 → chain-mtcp-jp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。线路 `cn.yaml`、`mtcp.conf` 和聚合 `runtime.yaml` 会一起备份、一起替换；共享 GOST 没能正常恢复时三者一起回滚。Watchdog 会统计该线路所有业务端口，慢路重抽前 Prewarm 还会再确认业务是否真正空闲。主业务端口和 Anchor 端口不能删除或覆盖。
 
 如果安装目录不是默认的 `/opt/gost-mtcp`, 管理时带上同样的环境变量:
 
@@ -315,17 +352,13 @@ Relay 服务名: relay-12002
 INSTALL_BASE=/root/mtcpjpv22 bash standalone-install.sh relay
 ```
 
-只有一条线路时安装器会自动识别; 多条线路并存时必须指定目标:
+只有一条线路时直接命令会自动识别；多条线路并存时菜单会列出别名、Remote endpoint、业务端口和当前状态，按编号选择即可。`CN_INSTANCE`、`CN_YAML_PATH` 和 `CN_MTCP_CONFIG_PATH` 仅保留给无人值守脚本使用。
 
-```bash
-CN_INSTANCE=jp bash standalone-install.sh relay
-```
-
-旧版 `$INSTALL_BASE/cn/cn.yaml` 平铺布局仍然兼容, 也可以用 `CN_YAML_PATH`、`CN_MTCP_CONFIG_PATH` 显式指定两个文件路径。
+旧版 `$INSTALL_BASE/cn/cn.yaml` 平铺布局会在首次重装线路时迁移并归档。共享 `runtime.yaml` 始终由编译器生成，不能直接手改。
 
 ## 重要注意事项
 
-⚠️ **Remote 防火墙必须配好** —— MTCP Relay 没有应用层认证, 千万不要对全网开放。防火墙里只放行 CN 的公网 IP 访问 MTCP 端口:
+⚠️ **Remote 防火墙仍然必须配好** —— 安装器现在会在 Relay 层校验密码，但鉴权不能替代网络层访问控制。防火墙里仍只放行 CN 的公网 IP 访问 MTCP 端口，以减少未授权连接和资源消耗:
 
 ```bash
 # UFW 示例
@@ -338,8 +371,8 @@ ufw allow from <CN_IP> to any port 6600 proto tcp
 # ❌ 错误
 systemctl enable gost-mtcp-jp-anchor.service
 
-# ✓ 正确(安装器已经自动配置好了)
-systemctl enable gost-mtcp-jp.service
+# ✓ 正确（安装器已经自动配置好了）
+systemctl enable gost-mtcp.service
 systemctl enable gost-mtcp-jp-watchdog.service
 ```
 
@@ -360,14 +393,14 @@ systemctl enable gost-mtcp-jp-watchdog.service
 
 ```bash
 # 查看服务日志
-journalctl -u gost-mtcp-jp.service -n 100
+journalctl -u gost-mtcp.service -n 100
 journalctl -u gost-mtcp-jp-watchdog.service -n 100
 
 # 查看状态
-cat /opt/gost-mtcp/cn/state/status.json | jq
+cat /opt/gost-mtcp/cn/instances/jp/state/status.json | jq
 
-# 查看事件历史
-tail -n 50 /opt/gost-mtcp/cn/state/events.jsonl
+# 查看事件历史（也可从 standalone 主菜单选择 4）
+tail -n 50 /opt/gost-mtcp/cn/instances/jp/state/events.jsonl
 
 # 检查 Remote 连通性
 timeout 2 bash -c "exec 3<>/dev/tcp/<REMOTE_IP>/6600" && echo "OK" || echo "FAIL"
@@ -391,15 +424,17 @@ gost-ecmp-pathlock/
 │   └── generate-standalone.sh # 从 canonical 文件生成 standalone 嵌入区
 ├── tests/
 │   └── run.sh                 # shell 语法、生成一致性和关键保护回归检查
-├── cn/                         # CN 端配置和脚本
-│   ├── cn.yaml
-│   ├── mtcp.conf
+├── cn/                         # CN 端 canonical 模板与共享脚本
+│   ├── cn.yaml                 # 单线路 fragment 模板
+│   ├── mtcp.conf               # 单线路 Watchdog 配置模板
+│   ├── compile-config.sh       # 合并所有线路为 runtime.yaml
 │   ├── mtcp-lib.sh
 │   ├── mtcp-prewarm.sh
 │   ├── mtcp-watchdog.sh
 │   └── *.service
 └── remote/                     # Remote 端配置
     ├── remote.yaml
+    ├── mtcp.auth               # 安装时生成的 0600 凭据文件（不提交）
     └── *.service
 ```
 

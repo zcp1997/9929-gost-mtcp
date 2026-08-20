@@ -6,8 +6,14 @@ cd "$ROOT_DIR"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
+file_mode() {
+    if stat -c '%a' "$1" 2>/dev/null; then
+        return
+    fi
+    stat -f '%Lp' "$1"
+}
 
-bash -n install.sh standalone-install.sh scripts/generate-standalone.sh \
+bash -n install.sh standalone-install.sh scripts/generate-standalone.sh cn/compile-config.sh \
     ecmp-test.sh cn/mtcp-lib.sh cn/mtcp-prewarm.sh cn/mtcp-watchdog.sh
 pass "all shell files parse"
 
@@ -61,11 +67,33 @@ pass "ECMP sampler binds TCP_INFO reads to the current FD and four-tuple"
 scripts/generate-standalone.sh --check >/dev/null
 pass "standalone embedded payload matches canonical files"
 
+grep -Fqx '    auther: mtcp-auth' remote/remote.yaml || fail "Remote Relay authenticator is missing"
+grep -Fqx '          file: /root/gost-ecmp-pathlock/cn/instances/default/mtcp.auth' cn/cn.yaml || \
+    fail "CN Relay connector auth is missing"
+grep -Fq 'bash "$PROJECT_ROOT/standalone-install.sh" cn' install.sh || \
+    fail "traditional installer does not delegate to the shared CN implementation"
+! grep -Eq '^[[:space:]]*password:' remote/remote.yaml cn/cn.yaml || fail "plaintext password embedded in YAML"
+grep -Fqx 'ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/runtime.yaml' \
+    cn/gost-ecmp-pathlock.service || fail "canonical CN unit does not use the aggregate config"
+pass "canonical installs use file-backed Relay auth and one aggregate GOST config"
+
+compile_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/pathlock-compile.XXXXXX")"
+cn/compile-config.sh "$compile_test_dir/runtime.yaml" cn/cn.yaml
+[[ "$(grep -c '^services:$' "$compile_test_dir/runtime.yaml")" == 1 && \
+   "$(grep -c '^chains:$' "$compile_test_dir/runtime.yaml")" == 1 ]] || \
+    fail "route compiler did not emit one aggregate document"
+if cn/compile-config.sh "$compile_test_dir/duplicate.yaml" cn/cn.yaml cn/cn.yaml >/dev/null 2>&1; then
+    fail "route compiler accepted duplicate services, chains, and Remote endpoints"
+fi
+rm -rf "$compile_test_dir"
+pass "route compiler rejects aggregate identity and endpoint conflicts"
+
 help_output="$(bash standalone-install.sh --help)"
-[[ "$help_output" == *"CN_INSTANCE"* ]] || fail "standalone help misses CN_INSTANCE"
+[[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* ]] || \
+    fail "standalone help misses menu or automation compatibility"
 pipe_help="$(bash -s -- --help < standalone-install.sh)"
-[[ "$pipe_help" == *"CN_INSTANCE"* ]] || fail "piped standalone help failed"
-pass "standalone supports file and piped execution"
+[[ "$pipe_help" == *"打开统一管理菜单"* ]] || fail "piped standalone help failed"
+pass "standalone supports the management menu plus file and piped execution"
 
 (
     integration_dir="$(mktemp -d "${TMPDIR:-/tmp}/standalone-integration.XXXXXX")"
@@ -90,10 +118,18 @@ case "\$command_name" in
 esac
 MOCK
     chmod +x "$integration_dir/bin/systemctl-mock"
-    for mock_command in ss flock timeout socat; do
+    for mock_command in flock timeout socat; do
         printf '#!/usr/bin/env bash\nexit 0\n' > "$integration_dir/bin/$mock_command"
         chmod +x "$integration_dir/bin/$mock_command"
     done
+    cat > "$integration_dir/bin/ss" <<'MOCK'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_BUSY_PORT:-}" && "$*" == *"sport = :$MOCK_BUSY_PORT"* && "$*" == *established* ]]; then
+    echo "0 0 127.0.0.1:$MOCK_BUSY_PORT 198.51.100.10:40000"
+fi
+exit 0
+MOCK
+    chmod +x "$integration_dir/bin/ss"
     PATH="$integration_dir/bin:$PATH"
 
     # 只加载 standalone 的函数区，避免执行 main 和后面的嵌入 payload。
@@ -103,6 +139,10 @@ MOCK
     trap 'rm -rf "$integration_dir"' EXIT
     EMBEDDED_SOURCE="$ROOT_DIR/standalone-install.sh"
     INSTALL_BASE="$integration_dir/install"
+    export MTCP_AUTH_PASSWORD="PathLock-Integration#2026"
+    valid_mtcp_auth_password "$MTCP_AUTH_PASSWORD" || fail "valid MTCP password was rejected"
+    if valid_mtcp_auth_password "too-short"; then fail "short MTCP password was accepted"; fi
+    if valid_mtcp_auth_password "contains whitespace"; then fail "MTCP password with spaces was accepted"; fi
     SYSTEMD_DIR="$integration_dir/systemd"
     SYSTEMCTL_BIN="$integration_dir/bin/systemctl-mock"
     download_gost() {
@@ -123,13 +163,17 @@ BUSINESS_PORT="45100"
 ANCHOR_PORT="45101"
 LEGACY
     awk '
-      /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
+      # 模拟升级前没有 connector.auth 的旧版 YAML，验证安装器会补上鉴权且保留 Relay。
+      skip_old_auth && /^          / { next }
+      skip_old_auth { skip_old_auth=0 }
+      /^        auth:[[:space:]]*$/ { skip_old_auth=1; next }
+      /^- name:[[:space:]]*mtcp-anchor([A-Za-z0-9_-]*)?[[:space:]]*$/ && !inserted {
         print "# standalone-relay: relay-45104"
         print "- name: relay-45104"
         print "  addr: :45104"
         print "  handler:"
         print "    type: tcp"
-        print "    chain: chain-mtcp"
+        print "    chain: chain-mtcp-default"
         print "  listener:"
         print "    type: tcp"
         print "  forwarder:"
@@ -156,26 +200,92 @@ LEGACY
 
     jp="$INSTALL_BASE/cn/instances/jp"
     us="$INSTALL_BASE/cn/instances/us"
-    [[ -f "$jp/cn.yaml" && -f "$jp/mtcp.conf" && -d "$jp/state" ]] || fail "jp instance missing"
-    [[ -f "$us/cn.yaml" && -f "$us/mtcp.conf" && -d "$us/state" ]] || fail "us instance missing"
+    [[ -f "$jp/cn.yaml" && -f "$jp/mtcp.conf" && -f "$jp/mtcp.auth" && -d "$jp/state" ]] || \
+        fail "jp instance or auth file missing"
+    [[ -f "$us/cn.yaml" && -f "$us/mtcp.conf" && -f "$us/mtcp.auth" && -d "$us/state" ]] || \
+        fail "us instance or auth file missing"
+    [[ "$(file_mode "$jp/mtcp.auth")" == 600 ]] || fail "CN auth file permissions are not 0600"
+    grep -Fqx "mtcp $MTCP_AUTH_PASSWORD" "$jp/mtcp.auth" || fail "CN auth credentials are incorrect"
+    grep -Fqx "          file: '$jp/mtcp.auth'" "$jp/cn.yaml" || fail "CN connector auth path was not rendered"
+    ! grep -Fq "$MTCP_AUTH_PASSWORD" "$jp/cn.yaml" || fail "CN password leaked into YAML"
     grep -q 'DST="45.142.125.253"' "$jp/mtcp.conf" || fail "jp config was overwritten"
     grep -q 'DST="198.51.100.20"' "$us/mtcp.conf" || fail "us config is incorrect"
-    grep -Fqx "ExecStartPre=/usr/bin/test -r $jp/cn.yaml" "$SYSTEMD_DIR/gost-mtcp-jp.service" || \
-        fail "main unit does not use isolated YAML"
+    grep -Fqx 'UNIT="gost-mtcp.service"' "$jp/mtcp.conf" || fail "jp does not use shared GOST unit"
+    grep -Fqx 'UNIT="gost-mtcp.service"' "$us/mtcp.conf" || fail "us does not use shared GOST unit"
+    [[ -f "$SYSTEMD_DIR/gost-mtcp.service" ]] || fail "shared GOST unit missing"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp-jp.service" && ! -e "$SYSTEMD_DIR/gost-mtcp-us.service" ]] || \
+        fail "per-route GOST main units still exist"
+    grep -Fqx "ExecStart=$INSTALL_BASE/cn/gost -D -C $INSTALL_BASE/cn/runtime.yaml" \
+        "$SYSTEMD_DIR/gost-mtcp.service" || fail "shared unit does not use aggregate YAML"
+    grep -Fq -- '- name: chain-mtcp-jp' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses jp chain"
+    grep -Fq -- '- name: chain-mtcp-us' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses us chain"
+    grep -Fq -- '- name: tcp-entry-jp' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses jp service"
+    grep -Fq -- '- name: tcp-entry-us' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses us service"
     grep -Fqx "ExecStart=$INSTALL_BASE/cn/mtcp-watchdog.sh $jp/mtcp.conf" \
-        "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" || fail "watchdog unit does not use isolated config"
+        "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" || fail "watchdog unit does not use isolated state config"
+
+    config_listing="$(list_installed_configurations)"
+    [[ "$config_listing" == *"线路 jp"* && "$config_listing" == *"线路 us"* && \
+       "$config_listing" == *"端口路径"* && "$config_listing" == *"127.0.0.1:2345"* ]] || \
+        fail "management menu did not list routes and port paths"
+    PROMPTS=(2); PROMPT_INDEX=0
+    selected_yaml=""; selected_config=""
+    select_cn_route selected_yaml selected_config "测试线路选择" >/dev/null || fail "route selection failed"
+    [[ "$selected_yaml" == "$us/cn.yaml" && "$selected_config" == "$us/mtcp.conf" ]] || \
+        fail "route selector did not return the selected instance"
+    unset CN_INSTANCE CN_YAML_PATH CN_MTCP_CONFIG_PATH
+    PROMPTS=(2); PROMPT_INDEX=0
+    relay_list_output="$(manage_cn_relays list)"
+    [[ "$relay_list_output" == *"tcp-entry-us"* ]] || \
+        fail "Relay manager still requires CN_INSTANCE for multiple routes"
+
+    mkdir -p "$jp/state"
+    printf '%s\n' '{"state":"FAST","reason":"healthy","route":"jp"}' > "$jp/state/status.json"
+    printf '%s\n' '{"event":"PREWARM_SUCCESS","route":"jp"}' > "$jp/state/events.jsonl"
+    PROMPTS=(1 1 b); PROMPT_INDEX=0
+    log_output="$(view_cn_route_logs)"
+    [[ "$log_output" == *'"event":"PREWARM_SUCCESS"'* && "$log_output" == *"events.jsonl"* ]] || \
+        fail "JSONL log menu did not show the selected route log"
+    PROMPTS=(2 q); PROMPT_INDEX=0
+    main_menu_output="$(interactive_main_menu)"
+    [[ "$main_menu_output" == *"全新安装 CN 端 / Remote 端"* && \
+       "$main_menu_output" == *"线路 jp"* && "$main_menu_output" == *"已退出"* ]] || \
+        fail "top-level management menu did not dispatch configuration listing"
+
+    set +e
+    ( PROMPTS=(duplicate 45.142.125.253 5201 45110 45111 40); PROMPT_INDEX=0; install_cn >/dev/null 2>&1 )
+    duplicate_endpoint_rc=$?
+    set -e
+    (( duplicate_endpoint_rc != 0 )) || fail "duplicate Remote endpoint was accepted in shared GOST"
+    set +e
+    ( export MOCK_BUSY_PORT=45100; unset CN_FORCE_RESTART; require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) \
+        >/dev/null 2>&1
+    busy_guard_rc=$?
+    set -e
+    (( busy_guard_rc != 0 )) || fail "shared GOST restart guard ignored active business"
+    ( export MOCK_BUSY_PORT=45100 CN_FORCE_RESTART=1; require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) \
+        >/dev/null 2>&1 || fail "CN_FORCE_RESTART did not override active-business guard"
+    ( export MOCK_BUSY_PORT=45100; unset CN_FORCE_RESTART; PATHLOCK_INTERACTIVE_MENU=1
+      PROMPTS=(y); PROMPT_INDEX=0
+      require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) >/dev/null 2>&1 || \
+        fail "management menu could not explicitly confirm an active-business restart"
 
     CN_RELAY_YAML="$jp/cn.yaml"; CN_RELAY_CONFIG="$jp/mtcp.conf"; CN_RELAY_DIR="$jp"
-    CN_RELAY_UNIT="gost-mtcp-jp.service"; CN_PRIMARY_PORT=45100; CN_ANCHOR_PORT=45101
+    CN_ROUTE_ID="jp"; CN_RELAY_UNIT="gost-mtcp.service"
+    CN_RELAY_WATCHDOG_UNIT="gost-mtcp-jp-watchdog.service"
+    CN_RELAY_CHAIN_NAME="chain-mtcp-jp"; CN_RELAY_ANCHOR_SERVICE="mtcp-anchor-jp"
+    CN_PRIMARY_PORT=45100; CN_ANCHOR_PORT=45101
+    CN_ROOT="$INSTALL_BASE/cn"; CN_RUNTIME_YAML="$CN_ROOT/runtime.yaml"
+    CN_COMPILE_SCRIPT="$CN_ROOT/compile-config.sh"
     relay_candidate="$(mktemp "$jp/.relay-test.XXXXXX")"
     awk '
-      /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
+      /^- name:[[:space:]]*mtcp-anchor-jp[[:space:]]*$/ && !inserted {
         print "# standalone-relay: relay-45106"
         print "- name: relay-45106"
         print "  addr: :45106"
         print "  handler:"
         print "    type: tcp"
-        print "    chain: chain-mtcp"
+        print "    chain: chain-mtcp-jp"
         print "  listener:"
         print "    type: tcp"
         print "  forwarder:"
@@ -193,13 +303,13 @@ LEGACY
 
     failed_candidate="$(mktemp "$jp/.relay-failure-test.XXXXXX")"
     awk '
-      /^- name:[[:space:]]*mtcp-anchor[[:space:]]*$/ && !inserted {
+      /^- name:[[:space:]]*mtcp-anchor-jp[[:space:]]*$/ && !inserted {
         print "# standalone-relay: relay-45105"
         print "- name: relay-45105"
         print "  addr: :45105"
         print "  handler:"
         print "    type: tcp"
-        print "    chain: chain-mtcp"
+        print "    chain: chain-mtcp-jp"
         print "  listener:"
         print "    type: tcp"
         print "  forwarder:"
@@ -217,6 +327,7 @@ LEGACY
     set -e
     (( relay_failure_rc != 0 )) || fail "Relay failure simulation unexpectedly succeeded"
     ! grep -q '45105' "$CN_RELAY_YAML" || fail "Relay YAML rollback failed"
+    ! grep -q '45105' "$CN_RUNTIME_YAML" || fail "aggregate YAML rollback failed"
     grep -q '^BUSINESS_PORTS="45100 45104 45106"$' "$CN_RELAY_CONFIG" || fail "Relay config rollback failed"
 
     set +e
@@ -225,9 +336,25 @@ LEGACY
     set -e
     (( reinstall_rc != 0 )) || fail "active CN reinstall was not refused"
 
+    source_tree="$integration_dir/source-tree"
+    mkdir -p "$source_tree/cn"
+    cp cn/mtcp.conf "$source_tree/cn/mtcp.conf"
+    old_install_base="$INSTALL_BASE"
+    INSTALL_BASE="$source_tree" PATHLOCK_SOURCE_TREE=1 \
+        ensure_cn_port_available 12000 "$source_tree/cn/instances/default/mtcp.conf" gost-mtcp.service \
+        gost-ecmp-pathlock.service || fail "source-tree canonical template was treated as a live route"
+    INSTALL_BASE="$old_install_base"
+    unset PATHLOCK_SOURCE_TREE
+
     PROMPTS=(45200); PROMPT_INDEX=0
     install_remote >/dev/null
+    remote_auth="$INSTALL_BASE/remote/mtcp.auth"
     grep -q 'addr: :45200' "$INSTALL_BASE/remote/remote.yaml" || fail "Remote port render failed"
+    grep -Fqx '    auther: mtcp-auth' "$INSTALL_BASE/remote/remote.yaml" || fail "Remote Relay auth is missing"
+    grep -Fqx "    path: '$remote_auth'" "$INSTALL_BASE/remote/remote.yaml" || fail "Remote auth path was not rendered"
+    grep -Fqx "mtcp $MTCP_AUTH_PASSWORD" "$remote_auth" || fail "Remote auth credentials are incorrect"
+    [[ "$(file_mode "$remote_auth")" == 600 ]] || fail "Remote auth file permissions are not 0600"
+    ! grep -Fq "$MTCP_AUTH_PASSWORD" "$INSTALL_BASE/remote/remote.yaml" || fail "Remote password leaked into YAML"
     grep -Fqx "ExecStart=$INSTALL_BASE/remote/gost -D -C $INSTALL_BASE/remote/remote.yaml" \
         "$SYSTEMD_DIR/gost-mtcp-remote.service" || fail "Remote unit render failed"
     grep -Fq "ExecStart=$integration_dir/bin/socat " "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service" || \
@@ -238,7 +365,7 @@ LEGACY
     set -e
     (( remote_reinstall_rc != 0 )) || fail "active Remote reinstall was not refused"
 )
-pass "standalone isolates CN lines, renders Remote, and refuses active reinstalls"
+pass "standalone menu manages multiple CN routes, port paths, JSONL logs, isolation, and rollback"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/mtcp-tests.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -275,7 +402,11 @@ grep -q 'PREWARM_ABORT_BUSY.*before_outer_kill\|abort_degraded_retry_if_busy "be
     fail "prewarm final busy barrier missing"
 grep -q 'DATA_PROBE_BREAKER_REARMED' cn/mtcp-watchdog.sh || fail "data probe half-open breaker missing"
 grep -q 'PROCESS_RECOVERY_ATTEMPT' cn/mtcp-watchdog.sh || fail "process recovery missing"
-pass "destructive-path guards and recovery breakers are present"
+grep -q 'RESET_ROUTE_OUTER' cn/mtcp-watchdog.sh || fail "route-local outer reset missing"
+route_reset_body="$(awk '/^reset_route_rate_limited\(\)/ { emit=1 } /^run_select\(\)/ { exit } emit { print }' cn/mtcp-watchdog.sh)"
+[[ "$route_reset_body" == *"kill_route_outers"* ]] || fail "route reset does not kill only route outers"
+[[ "$route_reset_body" != *'systemctl restart "$UNIT"'* ]] || fail "route fault still restarts shared GOST"
+pass "destructive paths isolate route outers and retain recovery breakers"
 
 awk '/^prune_epoch_list\(\)/ { emit=1 } /^set_state\(\)/ { exit } emit { print }' \
     cn/mtcp-watchdog.sh > "$tmp_dir/breakers.sh"

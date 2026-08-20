@@ -3,6 +3,9 @@ services:
   addr: :6600
   handler:
     type: relay
+    # GOST v3.2.6 的 MTCP listener 不消费 listener.auth；
+    # 在 Relay 协议层校验每条 logical stream，未认证请求无法转发。
+    auther: mtcp-auth
   listener:
     type: mtcp
     metadata:
@@ -13,3 +16,8 @@ services:
       mux.maxFrameSize: 32768
       mux.maxReceiveBuffer: 33554432
       mux.maxStreamBuffer: 4194304
+
+authers:
+- name: mtcp-auth
+  file:
+    path: /root/gost-ecmp-pathlock/remote/mtcp.auth
