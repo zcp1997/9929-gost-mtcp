@@ -117,13 +117,14 @@ bash /root/standalone-install.sh
 无参数运行就是统一管理菜单：
 
 ```text
-1) 全新安装 CN 端 / Remote 端
-2) 列出已有配置和端口路径
-3) 选择一个 CN 线路，增删端口转发
-4) 查看线路 JSONL 日志
+[1]  安装 / 新增线路
+[2]  查看线路与端口
+[3]  管理端口转发
+[4]  运行状态 / 日志
+[Q]  退出
 ```
 
-安装后继续运行同一条 `bash /root/standalone-install.sh` 即可管理，不需要设置 `CN_INSTANCE`。自动化场景仍可使用 `bash standalone-install.sh remote|cn|relay`。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的，安装器会自动去掉它寻找对应资产文件。
+交互菜单会显示共享服务、线路状态和 Remote 摘要；操作完成后按 Enter 返回，输入错误只中止当前操作，不会退出整个管理器。颜色仅在交互 TTY 中启用，设置 `NO_COLOR=1` 可强制关闭。安装后继续运行同一条 `bash /root/standalone-install.sh` 即可管理，不需要设置 `CN_INSTANCE`。自动化场景仍可使用 `bash standalone-install.sh remote|cn|relay`，其退出码与 fatal error 行为不变。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的，安装器会自动去掉它寻找对应资产文件。
 
 **传统方式(开发/调试用, 能看到完整代码)**
 

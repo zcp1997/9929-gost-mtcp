@@ -106,8 +106,8 @@ rm -rf "$compile_test_dir"
 pass "route compiler enforces aggregate uniqueness and fragment ownership"
 
 help_output="$(bash standalone-install.sh --help)"
-[[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* ]] || \
-    fail "standalone help misses menu or automation compatibility"
+[[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* && \
+   "$help_output" == *"NO_COLOR"* ]] || fail "standalone help misses menu or automation compatibility"
 pipe_help="$(bash -s -- --help < standalone-install.sh)"
 [[ "$pipe_help" == *"打开统一管理菜单"* ]] || fail "piped standalone help failed"
 pass "standalone supports the management menu plus file and piped execution"
@@ -178,6 +178,52 @@ MOCK
         printf -v "$output_var" '%s' "${PROMPTS[$PROMPT_INDEX]}"
         PROMPT_INDEX=$((PROMPT_INDEX + 1))
     }
+
+    NO_COLOR=1
+    ui_init
+    (( UI_COLOR_ENABLED == 0 )) || fail "NO_COLOR did not disable ANSI colors"
+    [[ -z "$UI_GREEN" && -z "$UI_RED" && -z "$UI_BLUE" ]] || fail "ANSI codes remain under NO_COLOR"
+    unset NO_COLOR
+    ui_init
+    badge_output="$(ui_status_badge FAST)"
+    [[ "$badge_output" == *"● FAST"* && "$badge_output" != *$'\033'* ]] || \
+        fail "non-TTY status badge is not plain text"
+
+    PATHLOCK_INTERACTIVE_MENU=1
+    PROMPTS=(not-a-port 45199); PROMPT_INDEX=0
+    ui_prompt_output="$integration_dir/ui-prompt.out"
+    ui_prompt_port ui_test_port "测试端口: " 12000 >"$ui_prompt_output" 2>&1 || \
+        fail "interactive port prompt did not retry"
+    [[ "$ui_test_port" == 45199 && "$PROMPT_INDEX" == 2 ]] || \
+        fail "interactive port prompt did not consume invalid then valid input"
+    grep -q '端口必须是 1-65535' "$ui_prompt_output" || fail "invalid port did not show a UI error"
+    set +e
+    ( PATHLOCK_INTERACTIVE_MENU=0; PROMPTS=(not-a-port); PROMPT_INDEX=0
+      ui_prompt_port ignored "测试端口: " 12000 ) >/dev/null 2>&1
+    automation_invalid_port_rc=$?
+    set -e
+    (( automation_invalid_port_rc != 0 )) || fail "automation mode stopped failing fast on invalid input"
+
+    ui_failure_tmp="$integration_dir/ui-failure.tmp"
+    ui_test_failure() {
+        : > "$ui_failure_tmp"
+        CLEANUP_PATHS+=("$ui_failure_tmp")
+        die "模拟用户输入错误"
+    }
+    PROMPTS=(""); PROMPT_INDEX=0
+    ui_action_output="$integration_dir/ui-action.out"
+    ui_run_action "测试操作" "主菜单" ui_test_failure >"$ui_action_output" 2>&1 || \
+        fail "menu action failure escaped to the whole manager"
+    [[ "$PROMPT_INDEX" == 1 ]] || fail "failed menu action did not pause before returning"
+    grep -q '测试操作 失败' "$ui_action_output" || fail "failed menu action did not render an error"
+    [[ ! -e "$ui_failure_tmp" ]] || fail "isolated menu action leaked temporary files"
+
+    relay_card_output="$integration_dir/relay-card.out"
+    ui_relay_change_card "新增" jp :12002 127.0.0.1:2347 chain-mtcp-jp 7 \
+        >"$relay_card_output" 2>&1
+    grep -q '即将新增端口转发' "$relay_card_output" && grep -q '当前存在 7 条活跃业务连接' "$relay_card_output" || \
+        fail "destructive Relay summary card is incomplete"
+    PATHLOCK_INTERACTIVE_MENU=0
 
     mkdir -p "$INSTALL_BASE/cn"
     cat > "$INSTALL_BASE/cn/mtcp.conf" <<'LEGACY'
@@ -327,9 +373,12 @@ LEGACY
         fail "management menu did not list routes and port paths"
     PROMPTS=(2); PROMPT_INDEX=0
     selected_yaml=""; selected_config=""
-    select_cn_route selected_yaml selected_config "测试线路选择" >/dev/null || fail "route selection failed"
+    route_selector_output="$integration_dir/route-selector.out"
+    select_cn_route selected_yaml selected_config "测试线路选择" >"$route_selector_output" || fail "route selection failed"
     [[ "$selected_yaml" == "$us/cn.yaml" && "$selected_config" == "$us/mtcp.conf" ]] || \
         fail "route selector did not return the selected instance"
+    grep -q '\[1\] jp' "$route_selector_output" && grep -q 'Remote   45.142.125.253:5201' "$route_selector_output" || \
+        fail "route selector is not rendered as a detailed list"
     unset CN_INSTANCE CN_YAML_PATH CN_MTCP_CONFIG_PATH
     PROMPTS=(2); PROMPT_INDEX=0
     relay_list_output="$(manage_cn_relays list)"
@@ -337,17 +386,21 @@ LEGACY
         fail "Relay manager still requires CN_INSTANCE for multiple routes"
 
     mkdir -p "$jp/state"
-    printf '%s\n' '{"state":"FAST","reason":"healthy","route":"jp"}' > "$jp/state/status.json"
+    printf '%s\n' '{"state":"FAST","reason":"PATH","route":"jp","minrtt_ms":"33.2","rtt_ms":"34.8","outer_count":1,"remote_reachable":"yes","data_plane_reachable":"yes","business_connections":0}' \
+        > "$jp/state/status.json"
     printf '%s\n' '{"event":"PREWARM_SUCCESS","route":"jp"}' > "$jp/state/events.jsonl"
     PROMPTS=(1 1 b); PROMPT_INDEX=0
     log_output="$(view_cn_route_logs)"
-    [[ "$log_output" == *'"event":"PREWARM_SUCCESS"'* && "$log_output" == *"events.jsonl"* ]] || \
-        fail "JSONL log menu did not show the selected route log"
-    PROMPTS=(2 q); PROMPT_INDEX=0
+    [[ "$log_output" == *'"event":"PREWARM_SUCCESS"'* && "$log_output" == *"minRTT"* && \
+       "$log_output" == *"33.2 ms"* ]] || fail "status/log menu did not show summary and route events"
+    PATHLOCK_INTERACTIVE_MENU=1
+    PROMPTS=(2 "" q); PROMPT_INDEX=0
     main_menu_output="$(interactive_main_menu)"
-    [[ "$main_menu_output" == *"全新安装 CN 端 / Remote 端"* && \
+    [[ "$main_menu_output" == *"GOST ECMP PathLock Manager"* && \
+       "$main_menu_output" == *"[1]  安装 / 新增线路"* && \
        "$main_menu_output" == *"线路 jp"* && "$main_menu_output" == *"已退出"* ]] || \
-        fail "top-level management menu did not dispatch configuration listing"
+        fail "top-level management dashboard did not dispatch configuration listing"
+    PATHLOCK_INTERACTIVE_MENU=0
 
     set +e
     ( PROMPTS=(duplicate 45.142.125.253 5201 45110 45111 40); PROMPT_INDEX=0; install_cn >/dev/null 2>&1 )
@@ -363,9 +416,13 @@ LEGACY
     ( export MOCK_BUSY_PORT=45100 CN_FORCE_RESTART=1; require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) \
         >/dev/null 2>&1 || fail "CN_FORCE_RESTART did not override active-business guard"
     ( export MOCK_BUSY_PORT=45100; unset CN_FORCE_RESTART; PATHLOCK_INTERACTIVE_MENU=1
-      PROMPTS=(y); PROMPT_INDEX=0
+      CN_RESTART_CONFIRMED_COUNT=""; PROMPTS=(y); PROMPT_INDEX=0
       require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) >/dev/null 2>&1 || \
         fail "management menu could not explicitly confirm an active-business restart"
+    ( export MOCK_BUSY_PORT=45100; unset CN_FORCE_RESTART; PATHLOCK_INTERACTIVE_MENU=1
+      CN_RESTART_CONFIRMED_COUNT=1; PROMPTS=(); PROMPT_INDEX=0
+      require_cn_restart_window "$INSTALL_BASE/cn" gost-mtcp.service ) >/dev/null 2>&1 || \
+        fail "Relay confirmation card caused a duplicate active-business prompt"
 
     CN_RELAY_YAML="$jp/cn.yaml"; CN_RELAY_CONFIG="$jp/mtcp.conf"; CN_RELAY_DIR="$jp"
     CN_ROUTE_ID="jp"; CN_RELAY_UNIT="gost-mtcp.service"
@@ -462,7 +519,7 @@ LEGACY
     set -e
     (( remote_reinstall_rc != 0 )) || fail "active Remote reinstall was not refused"
 )
-pass "standalone menu manages multiple CN routes, port paths, JSONL logs, isolation, and rollback"
+pass "standalone CLI renders dashboards, retries input, and preserves route isolation and rollback"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/mtcp-tests.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT

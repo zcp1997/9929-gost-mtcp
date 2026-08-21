@@ -20,6 +20,9 @@ PROMPT_FD=0
 PROMPT_FD_READY=0
 PATHLOCK_INTERACTIVE_MENU=0
 MTCP_AUTH_USERNAME="mtcp"
+CN_RESTART_CONFIRMED_COUNT=""
+UI_COLOR_ENABLED=0
+UI_RESET=""; UI_BLUE=""; UI_GREEN=""; UI_YELLOW=""; UI_RED=""; UI_DIM=""; UI_BOLD=""
 declare -a CLEANUP_PATHS=()
 declare -a DISCOVERED_CN_YAMLS=()
 declare -a DISCOVERED_CN_CONFIGS=()
@@ -36,14 +39,209 @@ cleanup() {
 
 trap cleanup EXIT
 
-show_banner() {
-    cat <<'BANNER'
-============================================================
-  gost-ecmp-pathlock 自包含安装器 v2.1.0
+ui_init() {
+    UI_COLOR_ENABLED=0
+    UI_RESET=""; UI_BLUE=""; UI_GREEN=""; UI_YELLOW=""; UI_RED=""; UI_DIM=""; UI_BOLD=""
+    if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+        UI_COLOR_ENABLED=1
+        UI_RESET=$'\033[0m'; UI_BLUE=$'\033[34m'; UI_GREEN=$'\033[32m'
+        UI_YELLOW=$'\033[33m'; UI_RED=$'\033[31m'; UI_DIM=$'\033[2m'; UI_BOLD=$'\033[1m'
+    fi
+}
 
-  基于单 GOST 进程 + 多 MTCP 线路的 ECMP 低延迟路径优选方案
-============================================================
-BANNER
+ui_clear() {
+    (( PATHLOCK_INTERACTIVE_MENU == 1 )) && [[ -t 1 ]] && printf '\033[2J\033[H'
+    return 0
+}
+
+ui_box_row() {
+    local text="$1" width=54 padding left right
+    padding=$((width - ${#text}))
+    if (( padding < 0 )); then padding=0; fi
+    left=$((padding / 2)); right=$((padding - left))
+    printf '%b║%*s%s%*s║%b\n' "$UI_BLUE" "$left" "" "$text" "$right" "" "$UI_RESET"
+}
+
+ui_header() {
+    local subtitle="${1:-}"
+    printf '%b\n' "${UI_BLUE}╔══════════════════════════════════════════════════════╗${UI_RESET}"
+    ui_box_row "GOST ECMP PathLock Manager"
+    ui_box_row "v${VERSION}"
+    printf '%b\n' "${UI_BLUE}╚══════════════════════════════════════════════════════╝${UI_RESET}"
+    [[ -z "$subtitle" ]] || printf '\n%b%s%b\n' "${UI_BOLD}${UI_BLUE}" "$subtitle" "$UI_RESET"
+}
+
+ui_success() { printf '%b✓%b %s\n' "$UI_GREEN" "$UI_RESET" "$*"; }
+ui_warn() { printf '%b⚠%b %s\n' "$UI_YELLOW" "$UI_RESET" "$*" >&2; }
+ui_error() { printf '%b✗%b %s\n' "$UI_RED" "$UI_RESET" "$*" >&2; }
+
+ui_status_badge() {
+    local value="${1:-UNKNOWN}" state color
+    state="${value%%/*}"
+    case "$state" in
+        FAST|RUNNING|UP|OK|yes) color="$UI_GREEN" ;;
+        DEGRADED|WARN|WARNING|STARTING) color="$UI_YELLOW" ;;
+        DOWN|FAULT|STOPPED|FAILED|FAIL|no) color="$UI_RED" ;;
+        *) color="$UI_DIM" ;;
+    esac
+    printf '%b● %s%b' "$color" "$value" "$UI_RESET"
+}
+
+ui_pause() {
+    local target="${1:-主菜单}" dummy
+    (( PATHLOCK_INTERACTIVE_MENU == 1 )) || return 0
+    echo
+    prompt_read dummy "按 Enter 返回${target}..." || true
+}
+
+ui_menu_choice() {
+    local output_var="$1" prompt="${2:-请选择 › }" value
+    prompt_read value "$prompt" || return 1
+    printf -v "$output_var" '%s' "$value"
+}
+
+ui_prompt_port() {
+    local output_var="$1" prompt="$2" default_value="${3:-}" value
+    while :; do
+        prompt_read value "$prompt" || return 1
+        value="${value:-$default_value}"
+        if valid_port "$value"; then
+            printf -v "$output_var" '%s' "$((10#$value))"
+            return 0
+        fi
+        if (( PATHLOCK_INTERACTIVE_MENU == 0 )); then
+            die "端口必须是 1-65535 之间的数字"
+        fi
+        ui_error "端口必须是 1-65535 之间的数字"
+    done
+}
+
+ui_confirm() {
+    local answer prompt="${1:-请选择 [y/N] › }"
+    while :; do
+        ui_menu_choice answer "$prompt" || return 1
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO|"") return 1 ;;
+            *)
+                (( PATHLOCK_INTERACTIVE_MENU == 1 )) || return 1
+                ui_error "请输入 Y 或 N"
+                ;;
+        esac
+    done
+}
+
+ui_run_action() {
+    local label="$1" return_target="$2" rc
+    shift 2
+    if (
+        # 子操作隔离执行，但重新挂载 cleanup；只清理本次操作创建的临时文件，
+        # 不触碰父菜单为 piped execution 保存的 EMBEDDED_SOURCE。
+        CLEANUP_PATHS=()
+        trap cleanup EXIT
+        "$@"
+    ); then
+        rc=0
+    else
+        rc=$?
+        ui_error "$label 失败（exit $rc）"
+    fi
+    ui_pause "$return_target"
+    return 0
+}
+
+ui_relay_change_card() {
+    local action="$1" route="$2" listen="$3" backend="$4" chain="$5" active="$6"
+    echo
+    printf '%b────────────────── 即将%s端口转发 ──────────────────%b\n' "$UI_BLUE" "$action" "$UI_RESET"
+    printf '\n  线路         %s\n' "$route"
+    printf '  CN 监听      %s\n' "$listen"
+    printf '  Remote 后端  %s\n' "$backend"
+    printf '  Chain        %s\n\n' "$chain"
+    ui_warn "此操作会重启共享 GOST"
+    if (( active > 0 )); then
+        ui_warn "当前存在 $active 条活跃业务连接"
+        ui_warn "重启将同时中断所有线路现有连接"
+    else
+        printf '  %b当前活跃连接：0%b\n' "$UI_DIM" "$UI_RESET"
+    fi
+    printf '%b──────────────────────────────────────────────────────%b\n\n' "$UI_BLUE" "$UI_RESET"
+}
+
+ui_json_value() {
+    local line="$1" key="$2" value
+    value="$(printf '%s\n' "$line" | sed -n "s/.*\"${key}\":\"\([^\"]*\)\".*/\1/p")"
+    if [[ -z "$value" ]]; then
+        value="$(printf '%s\n' "$line" | sed -n "s/.*\"${key}\":\([-0-9.][0-9.]*\).*/\1/p")"
+    fi
+    printf '%s\n' "$value"
+}
+
+ui_route_status_panel() {
+    local status_file="$1" line state reason minrtt rtt outer remote data business
+    if [[ ! -r "$status_file" ]]; then
+        ui_warn "状态尚未生成: $status_file"
+        return 0
+    fi
+    line="$(tail -n 1 "$status_file" 2>/dev/null || true)"
+    state="$(ui_json_value "$line" state)"; state="${state:-UNKNOWN}"
+    reason="$(ui_json_value "$line" reason)"; reason="${reason:--}"
+    minrtt="$(ui_json_value "$line" minrtt_ms)"; minrtt="${minrtt:--}"
+    rtt="$(ui_json_value "$line" rtt_ms)"; rtt="${rtt:--}"
+    outer="$(ui_json_value "$line" outer_count)"; outer="${outer:-0}"
+    remote="$(ui_json_value "$line" remote_reachable)"; remote="${remote:-unknown}"
+    data="$(ui_json_value "$line" data_plane_reachable)"; data="${data:-unknown}"
+    business="$(ui_json_value "$line" business_connections)"; business="${business:-0}"
+    case "$remote" in yes) remote="UP" ;; no) remote="DOWN" ;; *) remote="UNKNOWN" ;; esac
+    case "$data" in yes) data="OK" ;; no) data="FAIL" ;; *) data="UNKNOWN" ;; esac
+
+    printf '  %s\n' "$(ui_status_badge "$state")"
+    printf '  %-10s %s\n' "Reason" "$reason"
+    printf '  %-10s %s ms\n' "minRTT" "$minrtt"
+    printf '  %-10s %s ms\n' "RTT" "$rtt"
+    printf '  %-10s %s\n' "Outer" "$outer"
+    printf '  %-10s %s\n' "Remote" "$(ui_status_badge "$remote")"
+    printf '  %-10s %s\n' "DataPlane" "$(ui_status_badge "$data")"
+    printf '  %-10s %s\n' "Business" "$business"
+}
+
+ui_main_dashboard() {
+    local route_count main_unit="gost-mtcp.service" service_state="STOPPED"
+    local remote_summary="未配置" config dst port remote_yaml remote_addr
+    discover_cn_routes
+    route_count="${#DISCOVERED_CN_CONFIGS[@]}"
+    if (( route_count > 0 )); then
+        config="${DISCOVERED_CN_CONFIGS[0]}"
+        main_unit="$(read_config_value "$config" UNIT 2>/dev/null || true)"
+        main_unit="${main_unit:-gost-mtcp.service}"
+        dst="$(read_config_value "$config" DST 2>/dev/null || true)"
+        port="$(read_config_value "$config" PORT 2>/dev/null || true)"
+        remote_summary="${dst:-未知}:${port:-未知}"
+        (( route_count > 1 )) && remote_summary+=" (+$((route_count - 1)))"
+    else
+        remote_yaml="$INSTALL_BASE/remote/remote.yaml"
+        if [[ -r "$remote_yaml" ]]; then
+            remote_addr="$(awk '
+                /^- name:[[:space:]]*mtcp-server[[:space:]]*$/ { found=1; next }
+                found && /^  addr:[[:space:]]*/ { sub(/^  addr:[[:space:]]*/, ""); print; exit }
+                found && /^- name:[[:space:]]*/ { exit }
+            ' "$remote_yaml")"
+            remote_summary="本机监听 ${remote_addr:-未知}"
+        fi
+    fi
+    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" >/dev/null 2>&1 && service_state="RUNNING"
+
+    ui_header
+    echo
+    printf '  CN 共享服务 : %s\n' "$(ui_status_badge "$service_state")"
+    printf '  已配置线路  : %s\n' "$route_count"
+    printf '  Remote      : %b%s%b\n' "$UI_DIM" "$remote_summary" "$UI_RESET"
+    printf '\n  %b────────────────────────────────────────────────────%b\n' "$UI_DIM" "$UI_RESET"
+}
+
+show_banner() {
+    ui_init
+    ui_header "基于单 GOST 进程 + 多 MTCP 线路的 ECMP 路径管理"
 }
 
 show_usage() {
@@ -70,6 +268,7 @@ show_usage() {
   CN_INSTANCE                自动化 Relay 管理使用的线路别名（可选；菜单无需设置）
   MTCP_AUTH_PASSWORD         自动化安装用鉴权密码（两端相同，交互安装建议不设置）
   CN_FORCE_RESTART=1         有活跃业务时仍允许重启共享 GOST
+  NO_COLOR=1                 禁用交互菜单 ANSI 颜色（非 TTY 会自动禁用）
 
 示例：
   # 日常管理：安装、配置清单、端口转发和日志都从这里进入
@@ -197,28 +396,29 @@ extract_embedded() {
 select_install_role() {
     local output_var="$1" choice role confirm
     while :; do
+        ui_clear
+        ui_header "安装 / 新增线路"
         cat <<'MENU'
 
-全新安装：
+  [1]  CN      中国大陆入口端（接收业务、路径优选）
+  [2]  Remote  境外中转端（监听 MTCP、连接后端）
 
-  1) CN      中国大陆入口端（接收业务、路径优选）
-  2) Remote  境外中转端（监听 MTCP、连接后端）
-  b) 返回主菜单
+  [B]  返回主菜单
 
-建议先安装 Remote，再安装 CN。
+  建议先安装 Remote，再安装 CN。
 MENU
-        prompt_read choice "请选择 [1/2/b]: " || return 1
+        ui_menu_choice choice "请选择 › " || return 1
         case "$choice" in
             1) role="cn" ;;
             2) role="remote" ;;
             b|B|back|q|Q) return 1 ;;
             "") continue ;;
-            *) echo "无效输入" >&2; continue ;;
+            *) ui_error "无效选择: $choice"; ui_pause "安装菜单"; continue ;;
         esac
-        prompt_read confirm "确认安装 $role 端？[Y/n]: " || return 1
+        ui_menu_choice confirm "确认安装 $role 端？[Y/n] › " || return 1
         case "${confirm:-y}" in
             y|Y|yes|YES|"") printf -v "$output_var" '%s' "$role"; return 0 ;;
-            *) ;;
+            *) ui_warn "已取消" ;;
         esac
     done
 }
@@ -623,19 +823,24 @@ require_cn_restart_window() {
     "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" >/dev/null 2>&1 || return 0
     active="$(cn_active_business_count "$cn_dir")"
     (( active == 0 )) && return 0
+    if [[ "$PATHLOCK_INTERACTIVE_MENU" == 1 && "$CN_RESTART_CONFIRMED_COUNT" =~ ^[0-9]+$ &&
+          "$CN_RESTART_CONFIRMED_COUNT" == "$active" ]]; then
+        ui_warn "已确认中断 $active 条活跃业务连接"
+        return 0
+    fi
     if [[ "${CN_FORCE_RESTART:-0}" != 1 ]]; then
         if [[ "$PATHLOCK_INTERACTIVE_MENU" == 1 ]]; then
-            local confirm
-            echo "警告: 检测到 $active 条活跃业务连接；本次变更会重启共享 GOST，并中断所有线路现有连接。" >&2
-            prompt_read confirm "确认现在中断并继续？[y/N]: " || die "操作已取消"
-            case "$confirm" in
-                y|Y|yes|YES) echo "已确认中断 $active 条活跃业务连接。" >&2; return 0 ;;
-                *) die "操作已取消，配置未修改" ;;
-            esac
+            ui_warn "检测到 $active 条活跃业务连接"
+            ui_warn "本次变更会重启共享 GOST，并中断所有线路现有连接"
+            if ui_confirm "确认现在中断并继续？[y/N] › "; then
+                CN_RESTART_CONFIRMED_COUNT="$active"
+                return 0
+            fi
+            die "操作已取消，配置未修改"
         fi
         die "检测到 $active 条活跃业务连接，默认拒绝重启共享 GOST；确认可中断后使用 CN_FORCE_RESTART=1 重试"
     fi
-    echo "警告: CN_FORCE_RESTART=1，将中断 $active 条活跃业务连接。" >&2
+    ui_warn "CN_FORCE_RESTART=1，将中断 $active 条活跃业务连接"
 }
 
 start_cn_route_watchdogs() {
@@ -661,11 +866,12 @@ install_remote() {
     mkdir -p "$remote_dir" "$SYSTEMD_DIR"
     socat_bin="$(command -v socat)"
 
-    prompt_read mtcp_port "Remote MTCP 监听端口 [6600]: " || die "未输入 MTCP 端口"
-    mtcp_port="${mtcp_port:-6600}"
-    valid_port "$mtcp_port" || die "端口无效"
-    mtcp_port=$((10#$mtcp_port))
-    [[ "$mtcp_port" != 12346 ]] || die "12346 被 Anchor endpoint 占用"
+    while :; do
+        ui_prompt_port mtcp_port "Remote MTCP 监听端口 [6600]: " 6600 || die "未输入 MTCP 端口"
+        [[ "$mtcp_port" != 12346 ]] && break
+        (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "12346 被 Anchor endpoint 占用"
+        ui_error "12346 被 Anchor endpoint 占用，请选择其他端口"
+    done
     get_mtcp_auth_password auth_password "请设置 Remote MTCP 鉴权密码"
     auth_file="$remote_dir/mtcp.auth"
 
@@ -778,10 +984,22 @@ install_cn() {
         die "已安装线路的共享 PROCESS recovery 参数不一致；请统一后再安装或升级"
 
     echo "配置参数:"; echo
-    prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
-    remote_alias="${remote_alias:-default}"
-    [[ "$remote_alias" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "线路别名无效"
-    case "$remote_alias" in anchor|watchdog|*-anchor|*-watchdog) die "线路别名使用了保留后缀" ;; esac
+    while :; do
+        prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
+        remote_alias="${remote_alias:-default}"
+        if [[ ! "$remote_alias" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
+            (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "线路别名无效"
+            ui_error "线路别名只能包含字母、数字、下划线和连字符，长度不超过 32"
+            continue
+        fi
+        case "$remote_alias" in
+            anchor|watchdog|*-anchor|*-watchdog)
+                (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "线路别名使用了保留后缀"
+                ui_error "线路别名使用了保留后缀"; continue
+                ;;
+        esac
+        break
+    done
 
     route_prefix="gost-mtcp"
     [[ "$remote_alias" != default ]] && route_prefix="gost-mtcp-$remote_alias"
@@ -808,21 +1026,25 @@ install_cn() {
     while :; do
         prompt_read remote_ip "Remote IPv4 地址: " || die "未输入 Remote IPv4 地址"
         valid_ipv4 "$remote_ip" && break
-        echo "  无效的 IPv4 地址" >&2
+        ui_error "IPv4 地址无效，请重新输入"
     done
     remote_ip="$(normalize_ipv4 "$remote_ip")"
-    prompt_read remote_port "Remote MTCP 端口 [6600]: " || die "未输入 Remote MTCP 端口"
+    ui_prompt_port remote_port "Remote MTCP 端口 [6600]: " 6600 || die "未输入 Remote MTCP 端口"
     get_mtcp_auth_password auth_password "请输入 Remote 安装时设置的 MTCP 鉴权密码"
-    prompt_read business_port "CN 业务监听端口 [12000]: " || die "未输入 CN 业务监听端口"
-    prompt_read anchor_port "CN Anchor 监听端口 [12001]: " || die "未输入 CN Anchor 监听端口"
-    prompt_read rtt_threshold "RTT 快路阈值（ms）[40]: " || die "未输入 RTT 阈值"
-    remote_port="${remote_port:-6600}"; business_port="${business_port:-12000}"
-    anchor_port="${anchor_port:-12001}"; rtt_threshold="${rtt_threshold:-40}"
-    valid_port "$remote_port" && valid_port "$business_port" && valid_port "$anchor_port" || \
-        die "端口必须为 1-65535"
-    remote_port=$((10#$remote_port)); business_port=$((10#$business_port)); anchor_port=$((10#$anchor_port))
-    [[ "$business_port" != "$anchor_port" ]] || die "业务端口不能与 Anchor 端口相同"
-    [[ "$rtt_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "RTT 阈值无效"
+    ui_prompt_port business_port "CN 业务监听端口 [12000]: " 12000 || die "未输入 CN 业务监听端口"
+    while :; do
+        ui_prompt_port anchor_port "CN Anchor 监听端口 [12001]: " 12001 || die "未输入 CN Anchor 监听端口"
+        [[ "$business_port" != "$anchor_port" ]] && break
+        (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "业务端口不能与 Anchor 端口相同"
+        ui_error "Anchor 端口不能与业务端口相同"
+    done
+    while :; do
+        prompt_read rtt_threshold "RTT 快路阈值（ms）[40]: " || die "未输入 RTT 阈值"
+        rtt_threshold="${rtt_threshold:-40}"
+        [[ "$rtt_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] && break
+        (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "RTT 阈值无效"
+        ui_error "RTT 阈值必须是非负数字"
+    done
 
     # 单进程下 socket 归属依赖 PID + Remote endpoint；相同 DST:PORT 无法安全区分线路。
     for config in "$cn_dir"/instances/*/mtcp.conf; do
@@ -1176,11 +1398,16 @@ cn_route_state_summary() {
 }
 
 list_installed_configurations() {
-    local remote_yaml remote_addr index yaml config route dst port ports state
+    local remote_yaml remote_addr index yaml config route dst port ports state state_display
     local chain anchor primary name listen backend service_chain kind count
 
-    echo
-    echo "================ 已有配置与端口路径 ================"
+    if (( PATHLOCK_INTERACTIVE_MENU == 1 )); then
+        ui_clear
+        ui_header "线路与端口"
+    else
+        echo
+        echo "================ 已有配置与端口路径 ================"
+    fi
     remote_yaml="$INSTALL_BASE/remote/remote.yaml"
     if [[ -r "$remote_yaml" ]]; then
         remote_addr="$(awk '
@@ -1201,8 +1428,8 @@ list_installed_configurations() {
     discover_cn_routes
     if (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
         echo
-        echo "CN 线路：未发现已安装配置"
-        echo "======================================================"
+        ui_warn "CN 线路：未发现已安装配置"
+        if (( PATHLOCK_INTERACTIVE_MENU == 0 )); then echo "======================================================"; fi
         echo
         return 0
     fi
@@ -1223,10 +1450,11 @@ list_installed_configurations() {
         anchor="$(read_config_value "$config" ANCHOR_SERVICE 2>/dev/null || true)"
         primary="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
 
+        state_display="$(ui_status_badge "$state")"
         printf '\n  [%d] 线路 %s\n' "$((index + 1))" "$route"
         printf '      Remote    : %s:%s\n' "${dst:-未知}" "${port:-未知}"
         printf '      业务端口  : %s\n' "${ports:-未知}"
-        printf '      当前状态  : %s\n' "$state"
+        printf '      当前状态  : %s\n' "$state_display"
         printf '      cn.yaml   : %s\n' "$yaml"
         printf '      mtcp.conf : %s\n' "$config"
         printf '      端口路径：\n'
@@ -1248,22 +1476,28 @@ list_installed_configurations() {
         (( count > 0 )) || echo "        （未解析到 service）"
     done
     echo
-    echo "======================================================"
+    if (( PATHLOCK_INTERACTIVE_MENU == 0 )); then echo "======================================================"; fi
     echo
 }
 
 select_cn_route() {
     local output_yaml_var="$1" output_config_var="$2" title="${3:-请选择 CN 线路}"
-    local choice index config route dst port ports state
+    local choice index config route dst port ports state state_display
 
     discover_cn_routes
     if (( ${#DISCOVERED_CN_YAMLS[@]} == 0 )); then
-        echo "未发现已安装的 CN 线路，请先从主菜单执行全新安装。" >&2
+        ui_error "未发现已安装的 CN 线路，请先从主菜单执行安装 / 新增线路"
+        ui_pause "主菜单"
         return 1
     fi
 
-    echo
-    echo "${title}："
+    if (( PATHLOCK_INTERACTIVE_MENU == 1 )); then
+        ui_clear
+        ui_header "$title"
+    else
+        echo
+        echo "${title}："
+    fi
     for (( index=0; index<${#DISCOVERED_CN_YAMLS[@]}; index++ )); do
         config="${DISCOVERED_CN_CONFIGS[$index]}"
         route="$(read_config_value "$config" ROUTE_ID 2>/dev/null || true)"
@@ -1273,13 +1507,17 @@ select_cn_route() {
         ports="$(read_config_value "$config" BUSINESS_PORTS 2>/dev/null || true)"
         [[ -n "$ports" ]] || ports="$(read_config_value "$config" BUSINESS_PORT 2>/dev/null || true)"
         state="$(cn_route_state_summary "$config")"
-        printf '  %d) %-12s Remote=%s:%s  业务端口=%s  状态=%s\n' \
-            "$((index + 1))" "$route" "${dst:-未知}" "${port:-未知}" "${ports:-未知}" "$state"
+        state_display="$(ui_status_badge "$state")"
+        printf '\n  [%d] %s\n' "$((index + 1))" "$route"
+        printf '      Remote   %s:%s\n' "${dst:-未知}" "${port:-未知}"
+        printf '      端口     %s\n' "${ports:-未知}"
+        printf '      状态     %s\n' "$state_display"
     done
-    echo "  b) 返回"
+    echo
+    echo "  [B] 返回"
 
     while :; do
-        prompt_read choice "请选择线路 [1-${#DISCOVERED_CN_YAMLS[@]}/b]: " || return 1
+        ui_menu_choice choice "请选择 › " || return 1
         case "$choice" in b|B|back|q|Q) return 1 ;; esac
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DISCOVERED_CN_YAMLS[@]} )); then
             index=$((choice - 1))
@@ -1287,7 +1525,7 @@ select_cn_route() {
             printf -v "$output_config_var" '%s' "${DISCOVERED_CN_CONFIGS[$index]}"
             return 0
         fi
-        echo "无效选择" >&2
+        ui_error "无效选择: $choice"
     done
 }
 
@@ -1487,7 +1725,7 @@ apply_cn_relay_yaml() {
 
     if (( restart_ok == 1 )); then
         exec 8>&-
-        echo "✓ $action"
+        ui_success "$action"
         echo "Watchdog BUSINESS_PORTS 已同步为: $ports"
         echo "聚合配置已更新: $CN_RUNTIME_YAML"
         echo "备份: $backup, $config_backup, $runtime_backup"
@@ -1512,8 +1750,9 @@ apply_cn_relay_yaml() {
 }
 
 add_cn_relay() {
-    local listen_port backend service_name default_name
-    local existing_name existing_listen existing_backend existing_chain candidate confirm
+    local listen_port backend service_name default_name active
+    local existing_name existing_listen existing_backend existing_chain candidate
+    CN_RESTART_CONFIRMED_COUNT=""
 
     while :; do
         prompt_read listen_port "新增 CN 监听端口（例如 12002）: " || die "未输入监听端口"
@@ -1530,12 +1769,21 @@ add_cn_relay() {
         echo "后端地址格式无效，请使用 host:port 或 [IPv6]:port。" >&2
     done
     default_name="relay-$CN_ROUTE_ID-$listen_port"
-    prompt_read service_name "Relay 服务名 [$default_name]: " || die "未输入服务名"
-    service_name="${service_name:-$default_name}"
-    [[ "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
-        die "服务名只能包含字母、数字、下划线和连字符"
-    [[ "$service_name" != "$CN_RELAY_ANCHOR_SERVICE" ]] || \
-        die "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
+    while :; do
+        prompt_read service_name "Relay 服务名 [$default_name]: " || die "未输入服务名"
+        service_name="${service_name:-$default_name}"
+        if [[ ! "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+            (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "服务名只能包含字母、数字、下划线和连字符"
+            ui_error "服务名只能包含字母、数字、下划线和连字符"
+            continue
+        fi
+        if [[ "$service_name" == "$CN_RELAY_ANCHOR_SERVICE" ]]; then
+            (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
+            ui_error "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
+            continue
+        fi
+        break
+    done
 
     while IFS=$'\t' read -r existing_name existing_listen existing_backend existing_chain; do
         [[ "$existing_name" != "$service_name" ]] || die "服务名已存在: $service_name"
@@ -1545,9 +1793,13 @@ add_cn_relay() {
         die "本机端口已被其他进程监听: $listen_port"
     fi
 
-    echo "将增加: :$listen_port -> ${backend}（service=${service_name}，共用 ${CN_RELAY_CHAIN_NAME}）"
-    prompt_read confirm "确认修改并重启 ${CN_RELAY_UNIT}？[y/N]: " || die "操作已取消"
-    case "$confirm" in y|Y|yes|YES) ;; *) echo "已取消。"; return 0 ;; esac
+    active="$(cn_active_business_count "$CN_ROOT")"
+    ui_relay_change_card "新增" "$CN_ROUTE_ID" ":$listen_port" "$backend" "$CN_RELAY_CHAIN_NAME" "$active"
+    if ! ui_confirm "请选择 [y/N] › "; then
+        ui_warn "已取消，配置未修改"
+        return 0
+    fi
+    CN_RESTART_CONFIRMED_COUNT="$active"
 
     candidate="$(mktemp "$CN_RELAY_DIR/.cn.yaml.relay.XXXXXX")"
     if ! awk -v relay_name="$service_name" -v listen_port="$listen_port" \
@@ -1582,8 +1834,9 @@ add_cn_relay() {
 }
 
 remove_cn_relay() {
-    local requested="${1:-}" name listen backend chain line confirm candidate
+    local requested="${1:-}" name listen backend chain line candidate active
     local -a candidates=()
+    CN_RESTART_CONFIRMED_COUNT=""
 
     while IFS=$'\t' read -r name listen backend chain; do
         [[ "$name" == "$CN_RELAY_ANCHOR_SERVICE" || "$listen" == ":$CN_PRIMARY_PORT" || \
@@ -1601,10 +1854,15 @@ remove_cn_relay() {
             printf '  %d) %s  %s -> %s\n' "$index" "$name" "$listen" "$backend"
             index=$((index + 1))
         done
-        prompt_read choice "请选择编号: " || die "未选择 Relay"
-        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )) || \
-            die "选择无效"
-        requested="${candidates[$((choice - 1))]%%$'\t'*}"
+        while :; do
+            ui_menu_choice choice "请选择 › " || die "未选择 Relay"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
+                requested="${candidates[$((choice - 1))]%%$'\t'*}"
+                break
+            fi
+            (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "选择无效"
+            ui_error "选择无效: $choice"
+        done
     fi
 
     line=""
@@ -1614,9 +1872,13 @@ remove_cn_relay() {
     [[ -n "$line" ]] || die "未找到可删除 Relay: $requested"
     IFS=$'\t' read -r name listen backend chain <<< "$line"
 
-    prompt_read confirm "确认删除 ${name}（$listen -> ${backend}）并重启 ${CN_RELAY_UNIT}？[y/N]: " || \
-        die "操作已取消"
-    case "$confirm" in y|Y|yes|YES) ;; *) echo "已取消。"; return 0 ;; esac
+    active="$(cn_active_business_count "$CN_ROOT")"
+    ui_relay_change_card "删除" "$CN_ROUTE_ID" "$listen" "$backend" "$chain" "$active"
+    if ! ui_confirm "请选择 [y/N] › "; then
+        ui_warn "已取消，配置未修改"
+        return 0
+    fi
+    CN_RESTART_CONFIRMED_COUNT="$active"
 
     candidate="$(mktemp "$CN_RELAY_DIR/.cn.yaml.relay.XXXXXX")"
     if ! awk -v target="$name" '
@@ -1664,22 +1926,24 @@ manage_cn_relays() {
         remove|delete|rm) remove_cn_relay "$target" ;;
         "")
             while :; do
-                echo
-                echo "当前线路: $CN_ROUTE_ID    配置: $CN_RELAY_YAML"
+                ui_clear
+                ui_header "端口转发 · $CN_ROUTE_ID"
+                printf '\n  %b配置: %s%b\n' "$UI_DIM" "$CN_RELAY_YAML" "$UI_RESET"
                 list_cn_relays
                 cat <<'RELAY_MENU'
-  1) 增加端口转发
-  2) 删除端口转发
-  3) 刷新列表
-  b) 返回线路选择
+  [1]  增加端口转发
+  [2]  删除端口转发
+  [3]  刷新列表
+
+  [B]  返回线路选择
 RELAY_MENU
-                prompt_read choice "请选择 [1/2/3/b]: " || return 0
+                ui_menu_choice choice "请选择 › " || return 0
                 case "$choice" in
-                    1) add_cn_relay ;;
-                    2) remove_cn_relay ;;
+                    1) ui_run_action "新增端口转发" "端口转发" add_cn_relay ;;
+                    2) ui_run_action "删除端口转发" "端口转发" remove_cn_relay ;;
                     3) ;;
                     b|B|back|q|Q|quit|exit) return 0 ;;
-                    *) echo "无效选择" >&2 ;;
+                    *) ui_error "无效选择: $choice"; ui_pause "端口转发" ;;
                 esac
             done
             ;;
@@ -1698,7 +1962,7 @@ manage_selected_cn_route() {
 
 view_cn_route_logs() {
     local route_yaml route_config route event_file status_file choice
-    select_cn_route route_yaml route_config "请选择要查看日志的线路" || return 0
+    select_cn_route route_yaml route_config "请选择要查看状态 / 日志的线路" || return 0
     route="$(read_config_value "$route_config" ROUTE_ID 2>/dev/null || true)"
     [[ -n "$route" ]] || route="$(basename "$(dirname "$route_config")")"
     event_file="$(read_config_value "$route_config" EVENT_FILE 2>/dev/null || true)"
@@ -1707,77 +1971,91 @@ view_cn_route_logs() {
     [[ -n "$status_file" ]] || status_file="$(dirname "$route_config")/state/status.json"
 
     while :; do
-        cat <<LOG_MENU
+        if (( PATHLOCK_INTERACTIVE_MENU == 1 )); then
+            ui_clear
+            ui_header "状态与日志 · $route"
+        else
+            echo
+            echo "线路 $route · 状态与日志"
+        fi
+        echo
+        echo "  当前状态"
+        echo "  ───────────────────────────────────"
+        ui_route_status_panel "$status_file"
+        printf '\n  %b事件: %s%b\n' "$UI_DIM" "$event_file" "$UI_RESET"
+        cat <<'LOG_MENU'
 
-线路 $route 的运行记录：
-  JSONL 日志 : $event_file
-  状态快照   : $status_file
+  [1]  最近 50 条事件
+  [2]  实时跟踪日志（Ctrl-C 停止）
+  [3]  查看原始 status.json
 
-  1) 查看最近 50 条 JSONL 日志
-  2) 实时跟踪 JSONL 日志（Ctrl-C 停止）
-  3) 查看当前状态 JSON
-  b) 返回主菜单
+  [B]  返回主菜单
 LOG_MENU
-        prompt_read choice "请选择 [1/2/3/b]: " || return 0
+        ui_menu_choice choice "请选择 › " || return 0
         case "$choice" in
             1)
                 if [[ -r "$event_file" ]]; then
                     echo; tail -n 50 "$event_file"; echo
                 else
-                    echo "日志尚未生成: $event_file" >&2
+                    ui_error "日志尚未生成: $event_file"
                 fi
+                ui_pause "状态与日志"
                 ;;
             2)
                 if [[ -r "$event_file" ]]; then
-                    echo "正在跟踪 ${event_file}，按 Ctrl-C 返回。"
+                    ui_warn "正在跟踪 ${event_file}，按 Ctrl-C 返回"
                     tail -n 20 -f "$event_file" || true
                 else
-                    echo "日志尚未生成: $event_file" >&2
+                    ui_error "日志尚未生成: $event_file"
                 fi
+                ui_pause "状态与日志"
                 ;;
             3)
                 if [[ -r "$status_file" ]]; then
                     echo; tail -n 1 "$status_file"; echo
                 else
-                    echo "状态尚未生成: $status_file" >&2
+                    ui_error "状态尚未生成: $status_file"
                 fi
+                ui_pause "状态与日志"
                 ;;
             b|B|back|q|Q|quit|exit) return 0 ;;
-            *) echo "无效选择" >&2 ;;
+            *) ui_error "无效选择: $choice"; ui_pause "状态与日志" ;;
         esac
     done
 }
 
 interactive_main_menu() {
     local choice install_role
+    ui_init
     while :; do
+        ui_clear
+        ui_main_dashboard
         cat <<'MAIN_MENU'
 
-请选择操作：
+  [1]  安装 / 新增线路
+  [2]  查看线路与端口
+  [3]  管理端口转发
+  [4]  运行状态 / 日志
 
-  1) 全新安装 CN 端 / Remote 端
-  2) 列出已有配置和端口路径
-  3) 选择一个 CN 线路，增删端口转发
-  4) 查看线路 JSONL 日志
-  q) 退出
+  [Q]  退出
 MAIN_MENU
-        prompt_read choice "请选择 [1/2/3/4/q]: " || return 0
+        ui_menu_choice choice "请选择操作 › " || return 0
         case "$choice" in
             1)
                 install_role=""
                 if select_install_role install_role; then
                     case "$install_role" in
-                        cn) install_cn ;;
-                        remote) install_remote ;;
+                        cn) ui_run_action "CN 线路安装" "主菜单" install_cn ;;
+                        remote) ui_run_action "Remote 安装" "主菜单" install_remote ;;
                     esac
                 fi
                 ;;
-            2) list_installed_configurations ;;
+            2) list_installed_configurations; ui_pause "主菜单" ;;
             3) manage_selected_cn_route ;;
             4) view_cn_route_logs ;;
-            q|Q|quit|exit) echo "已退出。"; return 0 ;;
+            q|Q|quit|exit) ui_success "已退出"; return 0 ;;
             "") ;;
-            *) echo "无效选择" >&2 ;;
+            *) ui_error "无效选择: $choice"; ui_pause "主菜单" ;;
         esac
     done
 }
@@ -1823,7 +2101,7 @@ main() {
     check_root
 
     case "$selected_mode" in
-        menu) PATHLOCK_INTERACTIVE_MENU=1; show_banner; interactive_main_menu ;;
+        menu) PATHLOCK_INTERACTIVE_MENU=1; interactive_main_menu ;;
         remote) install_remote ;;
         cn) install_cn ;;
         relay) manage_cn_relays "$relay_action" "$relay_target" ;;
