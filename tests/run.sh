@@ -170,7 +170,23 @@ MOCK
         local mock_version="${MOCK_GOST_VERSION:-v1}" mock_rc=0
         mkdir -p "$2"
         [[ "$mock_version" == invalid ]] && mock_rc=1
-        printf '#!/usr/bin/env bash\n# mock-gost-%s\nexit %s\n' "$mock_version" "$mock_rc" > "$2/gost"
+        cat > "$2/gost" <<MOCK
+#!/usr/bin/env bash
+# mock-gost-$mock_version
+config=""
+while (( \$# > 0 )); do
+    if [[ "\$1" == -C ]]; then
+        shift
+        config="\${1:-}"
+    fi
+    shift || true
+done
+if [[ -n "\$config" && "\$config" != *.yaml ]]; then
+    echo "Unsupported Config Type \"\${config##*.}\"" >&2
+    exit 1
+fi
+exit $mock_rc
+MOCK
         chmod +x "$2/gost"
     }
     prompt_read() {

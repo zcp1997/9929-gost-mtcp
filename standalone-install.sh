@@ -990,7 +990,7 @@ install_cn() {
     local remote_alias remote_ip remote_port business_port anchor_port rtt_threshold auth_password
     local route_prefix anchor_unit watchdog_unit legacy_main_unit instance_dir state_dir auth_file
     local anchor_service chain_name
-    local yaml_template yaml_tmp conf_tmp auth_tmp runtime_tmp compile_tmp
+    local yaml_template yaml_tmp conf_tmp auth_tmp runtime_tmp runtime_stage compile_tmp
     local lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
     local business_ports legacy_unit config other_dst other_port migration_stamp candidate_script
     local shared_stage backup_dir restart_ok=0
@@ -1102,8 +1102,11 @@ install_cn() {
     yaml_tmp="$(mktemp "$instance_dir/.cn.yaml.XXXXXX")"
     conf_tmp="$(mktemp "$instance_dir/.mtcp.conf.XXXXXX")"
     auth_tmp="$(mktemp "$instance_dir/.mtcp.auth.XXXXXX")"
-    runtime_tmp="$(mktemp "$cn_dir/.runtime.yaml.XXXXXX")"
-    CLEANUP_PATHS+=("$yaml_template" "$yaml_tmp" "$conf_tmp" "$auth_tmp" "$runtime_tmp")
+    # GOST 依据配置文件的最终扩展名判断输入格式。不能把 mktemp 的随机后缀
+    # 直接交给 `gost -C`，否则会被当成未知配置类型。
+    runtime_stage="$(mktemp -d "$cn_dir/.runtime-candidate.XXXXXX")"
+    runtime_tmp="$runtime_stage/runtime.yaml"
+    CLEANUP_PATHS+=("$yaml_template" "$yaml_tmp" "$conf_tmp" "$auth_tmp" "$runtime_stage")
     write_mtcp_auth_file "$auth_tmp" "$auth_password"
 
     legacy_unit="$(read_config_value "$cn_dir/mtcp.conf" UNIT 2>/dev/null || true)"
@@ -1670,7 +1673,8 @@ validate_cn_relay_yaml() {
 
 apply_cn_relay_yaml() {
     local candidate="$1" action="$2" backup failed config_backup config_failed
-    local runtime_candidate runtime_backup runtime_failed config_candidate ports stamp restart_ok=0
+    local runtime_candidate runtime_candidate_dir runtime_backup runtime_failed
+    local config_candidate ports stamp restart_ok=0
 
     CLEANUP_PATHS+=("$candidate")
     exec 8>"$CN_ROOT/config.lock"
@@ -1691,8 +1695,9 @@ apply_cn_relay_yaml() {
     }
 
     config_candidate="$(mktemp "$CN_RELAY_DIR/.mtcp.conf.relay.XXXXXX")"
-    runtime_candidate="$(mktemp "$CN_ROOT/.runtime.yaml.relay.XXXXXX")"
-    CLEANUP_PATHS+=("$config_candidate" "$runtime_candidate")
+    runtime_candidate_dir="$(mktemp -d "$CN_ROOT/.runtime-relay-candidate.XXXXXX")"
+    runtime_candidate="$runtime_candidate_dir/runtime.yaml"
+    CLEANUP_PATHS+=("$config_candidate" "$runtime_candidate_dir")
     if ! awk -v ports="$ports" '
         /^BUSINESS_PORTS=/ { print "BUSINESS_PORTS=\"" ports "\""; updated=1; next }
         { print }
