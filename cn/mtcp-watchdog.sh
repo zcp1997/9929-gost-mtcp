@@ -278,7 +278,7 @@ allow_data_probe_restart() {
 }
 
 close_process_breaker() {
-    local now="${1:-$(now_epoch)}"
+    local now="${1:-$(now_epoch)}" expected_pid="${2:-${LAST_PID:-0}}" current_pid
     init_process_recovery_paths || return 1
     # fd 9 专用于短生命周期的共享 PROCESS lock；启动时的 route lock 由
     # Bash 动态分配到 >=10，不会与它冲突。
@@ -290,7 +290,8 @@ close_process_breaker() {
 
     # 只允许已持续健康的调用方关闭共享 breaker；同时要求最后一次全局
     # recovery 已经过完整 interval，避免漏看短暂 DOWN 的线路过早清空预算。
-    if ! service_is_active || (( $(get_main_pid) <= 0 )); then
+    current_pid="$(get_main_pid)"
+    if ! service_is_active || (( current_pid <= 0 )) || [[ "$current_pid" != "$expected_pid" ]]; then
         exec 9>&-
         return 1
     fi
@@ -304,6 +305,12 @@ close_process_breaker() {
         return 1
     fi
 
+    # load/interval 判断期间若 systemd 已换代，再次 fail closed；下一轮会重置健康基线。
+    current_pid="$(get_main_pid)"
+    if ! service_is_active || [[ "$current_pid" != "$expected_pid" ]]; then
+        exec 9>&-
+        return 1
+    fi
     log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
     reset_process_recovery_state
     if ! save_process_recovery_state; then
@@ -507,6 +514,15 @@ run_select() {
     esac
 }
 
+process_pid_changed() {
+    local current_pid="$1" now="$2"
+    [[ "$LAST_PID" != "$current_pid" ]] || return 1
+    # PROCESS 健康窗口必须绑定同一个 MainPID；即使短暂 DOWN 被轮询漏掉，
+    # 新 PID 也不能继承旧 PID 已累计的健康时间。
+    PROCESS_HEALTHY_SINCE="$now"
+    return 0
+}
+
 adopt_current() {
     local pid count sport info minrtt rtt
     pid="$(get_main_pid)"; count="$(get_gost_outer_count "$pid")"
@@ -570,14 +586,10 @@ while true; do
 
     PROCESS_DOWN_SINCE=0
 
-    if (( PROCESS_HEALTHY_SINCE == 0 )); then
-        PROCESS_HEALTHY_SINCE="$now"
-    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
-        close_process_breaker "$now" || true
-    fi
-
-    # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。
+    # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：当前 PID
+    # 从本轮开始累计健康时间，并明确记录 COLD_START，不冒充 GOST 重启。
     if (( HAVE_RUNTIME == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
         log_event "DOWN" "WATCHDOG_COLD_START" "INIT" "$pid"
         LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0; REMOTE_OK="unknown"
         reset_data_probe_state
@@ -590,8 +602,9 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
-    # 真正的 GOST PID 换代。
-    if [[ "$LAST_PID" != "$pid" ]]; then
+    # 必须先识别 PID 换代并重置健康基线，再判断是否可以关闭 PROCESS breaker。
+    # 这样 Restart=always 的短暂 DOWN 即使落在两个轮询之间，也不会继承旧 PID 的窗口。
+    if process_pid_changed "$pid" "$now"; then
         old_pid="$LAST_NONZERO_PID"
         (( old_pid > 0 )) || old_pid="$LAST_PID"
         stop_anchor
@@ -604,6 +617,12 @@ while true; do
             REMOTE_OK="no"; set_state "DOWN" "REMOTE" "$pid" "" "" "" 0
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+    fi
+
+    if (( PROCESS_HEALTHY_SINCE == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
+    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
+        close_process_breaker "$now" "$pid" || true
     fi
 
     count="$(get_gost_outer_count "$pid")"

@@ -514,6 +514,74 @@ compile_cn_runtime_candidate() {
     "$compiler" "$output" "${fragments[@]}"
 }
 
+cn_process_policy_value() {
+    local config="$1" key="$2" default_value="$3" value
+    if ! value="$(awk -F= -v wanted="$key" '
+        $1 == wanted {
+            value=substr($0,index($0,"=")+1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            gsub(/^[\047\"]|[\047\"]$/, "", value)
+            found++
+        }
+        END {
+            if (found > 1) exit 42
+            if (found == 1) print value
+        }
+    ' "$config")"; then
+        echo "$config 中 $key 重复定义" >&2
+        return 1
+    fi
+    value="${value:-$default_value}"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$config 中 $key 必须是正整数" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+cn_process_policy_signature() {
+    local config="$1" grace interval window maximum open
+    [[ -r "$config" ]] || { echo "PROCESS recovery 配置不可读: $config" >&2; return 1; }
+    grace="$(cn_process_policy_value "$config" PROCESS_RECOVERY_GRACE_SEC 10)" || return 1
+    interval="$(cn_process_policy_value "$config" PROCESS_RECOVERY_INTERVAL_SEC 60)" || return 1
+    window="$(cn_process_policy_value "$config" PROCESS_RECOVERY_WINDOW_SEC 600)" || return 1
+    maximum="$(cn_process_policy_value "$config" PROCESS_RECOVERY_MAX 3)" || return 1
+    open="$(cn_process_policy_value "$config" PROCESS_BREAKER_OPEN_SEC 600)" || return 1
+    printf '%s|%s|%s|%s|%s\n' "$grace" "$interval" "$window" "$maximum" "$open"
+}
+
+validate_cn_process_policy_consistency() {
+    local cn_dir="$1" target_config="${2:-}" candidate_config="${3:-}"
+    local config source policy baseline="" baseline_source="" candidate_seen=0
+
+    for config in "$cn_dir"/instances/*/mtcp.conf; do
+        [[ -f "$config" ]] || continue
+        if [[ -n "$candidate_config" && "$config" == "$target_config" ]]; then
+            source="$candidate_config"
+            candidate_seen=1
+        else
+            source="$config"
+        fi
+        policy="$(cn_process_policy_signature "$source")" || return 1
+        if [[ -z "$baseline" ]]; then
+            baseline="$policy"
+            baseline_source="$source"
+        elif [[ "$policy" != "$baseline" ]]; then
+            echo "共享 PROCESS recovery 参数不一致: $source [$policy] != $baseline_source [$baseline]" >&2
+            return 1
+        fi
+    done
+
+    if [[ -n "$candidate_config" && "$candidate_seen" == 0 ]]; then
+        policy="$(cn_process_policy_signature "$candidate_config")" || return 1
+        if [[ -n "$baseline" && "$policy" != "$baseline" ]]; then
+            echo "共享 PROCESS recovery 参数不一致: $candidate_config [$policy] != $baseline_source [$baseline]" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
 stop_cn_route_controls() {
     local cn_dir="$1" strict="${2:-0}" config anchor watchdog failed=0
     for config in "$cn_dir"/instances/*/mtcp.conf; do
@@ -706,6 +774,8 @@ install_cn() {
     mkdir -p "$cn_dir/instances" "$SYSTEMD_DIR"
     exec 8>"$cn_dir/config.lock"
     flock -n 8 || die "另一项 CN 配置操作正在进行"
+    validate_cn_process_policy_consistency "$cn_dir" || \
+        die "已安装线路的共享 PROCESS recovery 参数不一致；请统一后再安装或升级"
 
     echo "配置参数:"; echo
     prompt_read remote_alias "Remote 线路别名（如 de、us，回车=default）: " || die "未输入线路别名"
@@ -838,6 +908,8 @@ install_cn() {
         END { for (key in v) if (seen[key] != 1) exit 42 }
     ' > "$conf_tmp" || die "canonical CN Watchdog 配置结构不符合预期"
     chmod 0644 "$yaml_tmp" "$conf_tmp"
+    validate_cn_process_policy_consistency "$cn_dir" "$instance_dir/mtcp.conf" "$conf_tmp" || \
+        die "候选线路与现有线路的共享 PROCESS recovery 参数不一致"
 
     compile_cn_runtime_candidate "$cn_dir" "$instance_dir/cn.yaml" "$yaml_tmp" "$runtime_tmp" \
         "$compile_tmp" || \
@@ -1370,6 +1442,10 @@ apply_cn_relay_yaml() {
     ' "$CN_RELAY_CONFIG" > "$config_candidate"; then
         rm -f "$candidate" "$config_candidate" "$runtime_candidate"
         die "无法生成 BUSINESS_PORTS 配置，原配置未修改"
+    fi
+    if ! validate_cn_process_policy_consistency "$CN_ROOT" "$CN_RELAY_CONFIG" "$config_candidate"; then
+        rm -f "$candidate" "$config_candidate" "$runtime_candidate"
+        die "各线路共享 PROCESS recovery 参数不一致，原配置未修改"
     fi
     if ! compile_cn_runtime_candidate "$CN_ROOT" "$CN_RELAY_YAML" "$candidate" "$runtime_candidate" ||
        ! "$CN_ROOT/gost" -C "$runtime_candidate" -O yaml >/dev/null; then
@@ -1964,7 +2040,7 @@ RESTART_COOLDOWN_SEC="60"
 MULTI_CONFIRM_COUNT="2"
 # GOST 因 systemd StartLimit 等原因停止时，低频尝试 reset-failed + restart。
 # PROCESS breaker/budget 属于共享 UNIT，状态写入 /run/gost-mtcp-process-recovery.state；
-# 所有线路使用同一套默认参数，安装器生成的实例会保持一致。
+# 所有线路必须使用完全一致的 effective 参数；CN 配置事务发现漂移会 fail closed。
 PROCESS_RECOVERY_GRACE_SEC="10"
 PROCESS_RECOVERY_INTERVAL_SEC="60"
 PROCESS_RECOVERY_WINDOW_SEC="600"
@@ -3107,7 +3183,7 @@ allow_data_probe_restart() {
 }
 
 close_process_breaker() {
-    local now="${1:-$(now_epoch)}"
+    local now="${1:-$(now_epoch)}" expected_pid="${2:-${LAST_PID:-0}}" current_pid
     init_process_recovery_paths || return 1
     # fd 9 专用于短生命周期的共享 PROCESS lock；启动时的 route lock 由
     # Bash 动态分配到 >=10，不会与它冲突。
@@ -3119,7 +3195,8 @@ close_process_breaker() {
 
     # 只允许已持续健康的调用方关闭共享 breaker；同时要求最后一次全局
     # recovery 已经过完整 interval，避免漏看短暂 DOWN 的线路过早清空预算。
-    if ! service_is_active || (( $(get_main_pid) <= 0 )); then
+    current_pid="$(get_main_pid)"
+    if ! service_is_active || (( current_pid <= 0 )) || [[ "$current_pid" != "$expected_pid" ]]; then
         exec 9>&-
         return 1
     fi
@@ -3133,6 +3210,12 @@ close_process_breaker() {
         return 1
     fi
 
+    # load/interval 判断期间若 systemd 已换代，再次 fail closed；下一轮会重置健康基线。
+    current_pid="$(get_main_pid)"
+    if ! service_is_active || [[ "$current_pid" != "$expected_pid" ]]; then
+        exec 9>&-
+        return 1
+    fi
     log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
     reset_process_recovery_state
     if ! save_process_recovery_state; then
@@ -3336,6 +3419,15 @@ run_select() {
     esac
 }
 
+process_pid_changed() {
+    local current_pid="$1" now="$2"
+    [[ "$LAST_PID" != "$current_pid" ]] || return 1
+    # PROCESS 健康窗口必须绑定同一个 MainPID；即使短暂 DOWN 被轮询漏掉，
+    # 新 PID 也不能继承旧 PID 已累计的健康时间。
+    PROCESS_HEALTHY_SINCE="$now"
+    return 0
+}
+
 adopt_current() {
     local pid count sport info minrtt rtt
     pid="$(get_main_pid)"; count="$(get_gost_outer_count "$pid")"
@@ -3399,14 +3491,10 @@ while true; do
 
     PROCESS_DOWN_SINCE=0
 
-    if (( PROCESS_HEALTHY_SINCE == 0 )); then
-        PROCESS_HEALTHY_SINCE="$now"
-    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
-        close_process_breaker "$now" || true
-    fi
-
-    # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。
+    # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：当前 PID
+    # 从本轮开始累计健康时间，并明确记录 COLD_START，不冒充 GOST 重启。
     if (( HAVE_RUNTIME == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
         log_event "DOWN" "WATCHDOG_COLD_START" "INIT" "$pid"
         LAST_PID="$pid"; LAST_NONZERO_PID="$pid"; LAST_SPORT=""; ZERO_SINCE=0; MULTI_SEEN=0; REMOTE_OK="unknown"
         reset_data_probe_state
@@ -3419,8 +3507,9 @@ while true; do
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
 
-    # 真正的 GOST PID 换代。
-    if [[ "$LAST_PID" != "$pid" ]]; then
+    # 必须先识别 PID 换代并重置健康基线，再判断是否可以关闭 PROCESS breaker。
+    # 这样 Restart=always 的短暂 DOWN 即使落在两个轮询之间，也不会继承旧 PID 的窗口。
+    if process_pid_changed "$pid" "$now"; then
         old_pid="$LAST_NONZERO_PID"
         (( old_pid > 0 )) || old_pid="$LAST_PID"
         stop_anchor
@@ -3433,6 +3522,12 @@ while true; do
             REMOTE_OK="no"; set_state "DOWN" "REMOTE" "$pid" "" "" "" 0
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
+    fi
+
+    if (( PROCESS_HEALTHY_SINCE == 0 )); then
+        PROCESS_HEALTHY_SINCE="$now"
+    elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
+        close_process_breaker "$now" "$pid" || true
     fi
 
     count="$(get_gost_outer_count "$pid")"

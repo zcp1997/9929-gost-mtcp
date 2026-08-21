@@ -260,7 +260,7 @@ DATA_PROBE_BREAKER_OPEN_SEC=600
 
 把 `DATA_PROBE_ENABLED` 改成 `no` 可以退回旧版行为, 只看 outer 的 TCP 状态。如果探测 endpoint 配错了或者一直失败, 10 分钟内线路 outer 重置满 3 次就会进 `FAULT/DATA_PROBE_BREAKER`, 停 10 分钟不再重置; 之后只放一次 half-open 试探, 数据面探测成功了才会关闭熔断。
 
-GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。PROCESS breaker 是共享 GOST 的全局状态：所有线路通过 `/run/gost-mtcp-process-recovery.lock` 串行读改写同一份 `/run/gost-mtcp-process-recovery.state`，共同使用一套恢复预算，而不是每条线路各算 3 次。进程连续健康 60 秒后熔断器自动关闭。
+GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。PROCESS breaker 是共享 GOST 的全局状态：所有线路通过 `/run/gost-mtcp-process-recovery.lock` 串行读改写同一份 `/run/gost-mtcp-process-recovery.state`，共同使用一套恢复预算，而不是每条线路各算 3 次。只有同一个 MainPID 连续健康 60 秒后熔断器才会关闭；PID 换代会立即重置健康计时。所有实例的 `PROCESS_RECOVERY_GRACE_SEC`、`PROCESS_RECOVERY_INTERVAL_SEC`、`PROCESS_RECOVERY_WINDOW_SEC`、`PROCESS_RECOVERY_MAX` 和 `PROCESS_BREAKER_OPEN_SEC` 必须一致，CN 安装、升级及 Relay 配置事务发现参数漂移时会 fail closed。
 
 ### 故障恢复路径(均已实测)
 

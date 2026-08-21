@@ -247,6 +247,23 @@ LEGACY
     grep -Fqx "ExecStart=$INSTALL_BASE/cn/mtcp-watchdog.sh $jp/mtcp.conf" \
         "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" || fail "watchdog unit does not use isolated state config"
 
+    cp -p "$us/mtcp.conf" "$integration_dir/us.mtcp.conf.policy-backup"
+    sed -i.bak 's/^PROCESS_RECOVERY_MAX=.*/PROCESS_RECOVERY_MAX="5"/' "$us/mtcp.conf"
+    rm -f "$us/mtcp.conf.bak"
+    set +e
+    policy_failure_output="$(
+      PROMPTS=(policyfail 203.0.113.33 6703 45126 45127 45); PROMPT_INDEX=0
+      install_cn 2>&1
+    )"
+    policy_failure_rc=$?
+    set -e
+    (( policy_failure_rc != 0 )) || fail "inconsistent route-local PROCESS policy was accepted"
+    [[ "$policy_failure_output" == *"共享 PROCESS recovery 参数不一致"* ]] || \
+        fail "PROCESS policy mismatch did not fail for the expected reason"
+    mv -f "$integration_dir/us.mtcp.conf.policy-backup" "$us/mtcp.conf"
+    ! grep -Fq 'chain-mtcp-policyfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "PROCESS policy mismatch modified aggregate runtime"
+
     # 正式 shared artifacts 必须在全部 validation 前保持不变，并在 commit 后的
     # service failure 中与 route/runtime/units 一起回滚。
     shared_marker="# preserved-shared-artifact-v1"
@@ -487,6 +504,35 @@ route_reset_body="$(awk '/^reset_route_rate_limited\(\)/ { emit=1 } /^run_select
 [[ "$route_reset_body" == *"kill_route_outers"* ]] || fail "route reset does not kill only route outers"
 [[ "$route_reset_body" != *'systemctl restart "$UNIT"'* ]] || fail "route fault still restarts shared GOST"
 pass "destructive paths isolate route outers and retain recovery breakers"
+
+awk '/^process_pid_changed\(\)/ { emit=1 } /^adopt_current\(\)/ { exit } emit { print }' \
+    cn/mtcp-watchdog.sh > "$tmp_dir/process-health.sh"
+(
+    # shellcheck disable=SC1090
+    source "$tmp_dir/process-health.sh"
+    LAST_PID=100
+    PROCESS_HEALTHY_SINCE=1000
+    process_pid_changed 200 1032 || fail "a new GOST PID was not detected"
+    [[ "$PROCESS_HEALTHY_SINCE" == 1032 ]] || \
+        fail "a new GOST PID inherited the old PID health window"
+    (( 1060 - PROCESS_HEALTHY_SINCE < 60 )) || \
+        fail "a 28-second-old replacement PID was treated as healthy for 60 seconds"
+    LAST_PID=200
+    if process_pid_changed 200 1060; then fail "an unchanged GOST PID was reported as changed"; fi
+    [[ "$PROCESS_HEALTHY_SINCE" == 1032 ]] || fail "same-PID polling reset the health window"
+)
+awk '
+    /^while true; do/ { active=1 }
+    active && /if process_pid_changed / { changed=NR }
+    active && /close_process_breaker / { closed=NR }
+    active && /count="\$\(get_gost_outer_count/ { exit }
+    END { exit !(changed > 0 && closed > changed) }
+' cn/mtcp-watchdog.sh || fail "PROCESS breaker can close before PID-change handling"
+grep -Fq 'close_process_breaker "$now" "$pid"' cn/mtcp-watchdog.sh || \
+    fail "PROCESS breaker close does not carry the stable PID into the lock"
+grep -Fq '[[ "$current_pid" != "$expected_pid" ]]' cn/mtcp-watchdog.sh || \
+    fail "PROCESS breaker close does not recheck the expected PID under lock"
+pass "PROCESS breaker health requires one stable MainPID for the full interval"
 
 awk '/^prune_epoch_list\(\)/ { emit=1 } /^set_state\(\)/ { exit } emit { print }' \
     cn/mtcp-watchdog.sh > "$tmp_dir/breakers.sh"
