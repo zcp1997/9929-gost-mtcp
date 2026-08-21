@@ -350,18 +350,18 @@ prepare_prompt_input() {
 }
 
 prompt_read() {
-    local output_var="$1" prompt="$2" value
+    local output_var="$1" prompt="$2"
     prepare_prompt_input
-    IFS= read -r -u "$PROMPT_FD" -p "$prompt" value || return 1
-    printf -v "$output_var" '%s' "$value"
+    # 直接让 read 写入调用方变量。这里不能再声明 local value：Bash 的动态
+    # 作用域会让 `prompt_read value` 写回本函数自身，调用方仍保持 unset。
+    IFS= read -r -u "$PROMPT_FD" -p "$prompt" "$output_var" || return 1
 }
 
 prompt_secret() {
-    local output_var="$1" prompt="$2" value
+    local output_var="$1" prompt="$2"
     prepare_prompt_input
-    IFS= read -r -s -u "$PROMPT_FD" -p "$prompt" value || return 1
+    IFS= read -r -s -u "$PROMPT_FD" -p "$prompt" "$output_var" || return 1
     printf '\n' >&2
-    printf -v "$output_var" '%s' "$value"
 }
 
 valid_mtcp_auth_password() {
@@ -803,19 +803,24 @@ validate_cn_process_policy_consistency() {
 }
 
 stop_cn_route_controls() {
-    local cn_dir="$1" strict="${2:-0}" config anchor watchdog failed=0
+    local cn_dir="$1" strict="${2:-0}" config anchor watchdog unit stop_rc failed=0
     for config in "$cn_dir"/instances/*/mtcp.conf; do
         [[ -r "$config" ]] || continue
         anchor="$(read_config_value "$config" ANCHOR_UNIT 2>/dev/null || true)"
         watchdog="$(read_config_value "$config" WATCHDOG_UNIT 2>/dev/null || true)"
-        if [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] &&
-           ! "$SYSTEMCTL_BIN" stop "$watchdog" >/dev/null 2>&1; then
-            if (( strict == 1 )); then failed=1; fi
-        fi
-        if [[ "$anchor" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] &&
-           ! "$SYSTEMCTL_BIN" stop "$anchor" >/dev/null 2>&1; then
-            if (( strict == 1 )); then failed=1; fi
-        fi
+        for unit in "$watchdog" "$anchor"; do
+            [[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
+            stop_rc=0
+            "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || stop_rc=$?
+            # `systemctl stop` 对不存在的旧 unit 会非零退出，但它已满足“未运行”。
+            # 严格事务只应拒绝停止后仍 active 的控制单元。
+            if "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1; then
+                if (( strict == 1 )); then
+                    echo "控制单元停止后仍在运行: $unit（systemctl stop exit $stop_rc）" >&2
+                    failed=1
+                fi
+            fi
+        done
     done
     (( failed == 0 ))
 }

@@ -189,6 +189,20 @@ exit $mock_rc
 MOCK
         chmod +x "$2/gost"
     }
+
+    # 使用真实 prompt_read 覆盖嵌套 helper 的动态作用域场景；过去输入虽然
+    # 成功读取，却被 prompt_read 自己的 local value 吞掉并触发 set -u。
+    printf 'Q\n45199\n' > "$integration_dir/prompt-input"
+    exec 7< "$integration_dir/prompt-input"
+    PROMPT_FD=7; PROMPT_FD_READY=1
+    real_menu_choice=""; real_prompt_port=""
+    ui_menu_choice real_menu_choice "测试菜单: "
+    ui_prompt_port real_prompt_port "测试端口: " 12000
+    exec 7<&-
+    PROMPT_FD=0; PROMPT_FD_READY=0
+    [[ "$real_menu_choice" == Q && "$real_prompt_port" == 45199 ]] || \
+        fail "real prompt input was not returned through nested UI helpers"
+
     prompt_read() {
         local output_var="$1"
         printf -v "$output_var" '%s' "${PROMPTS[$PROMPT_INDEX]}"
@@ -350,6 +364,15 @@ LEGACY
         fail "formal GOST changed before candidate validation completed"
     ! grep -Fq 'chain-mtcp-validationfail' "$INSTALL_BASE/cn/runtime.yaml" || \
         fail "failed validation leaked into aggregate runtime"
+
+    stale_controls="$integration_dir/stale-controls"
+    mkdir -p "$stale_controls/instances/old"
+    cat > "$stale_controls/instances/old/mtcp.conf" <<'STALE'
+WATCHDOG_UNIT="removed-watchdog.service"
+ANCHOR_UNIT="removed-anchor.service"
+STALE
+    ( export MOCK_FAIL_STOP=1; stop_cn_route_controls "$stale_controls" 1 ) || \
+        fail "already-inactive stale control units blocked the shared transaction"
 
     set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_STOP=1
