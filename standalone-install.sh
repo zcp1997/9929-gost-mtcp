@@ -177,6 +177,17 @@ ui_json_value() {
     printf '%s\n' "$value"
 }
 
+ui_follow_log() {
+    local event_file="$1" tail_pid=""
+    # tail 在独立进程中运行；菜单临时接管 SIGINT，只终止 tail，不退出 manager。
+    trap 'if [[ -n "${tail_pid:-}" ]]; then kill "$tail_pid" >/dev/null 2>&1 || true; fi' INT
+    tail -n 20 -f "$event_file" &
+    tail_pid=$!
+    wait "$tail_pid" 2>/dev/null || true
+    trap - INT
+    ui_success "已停止实时跟踪"
+}
+
 ui_route_status_panel() {
     local status_file="$1" line state reason minrtt rtt outer remote data business
     if [[ ! -r "$status_file" ]]; then
@@ -207,7 +218,9 @@ ui_route_status_panel() {
 
 ui_main_dashboard() {
     local route_count main_unit="gost-mtcp.service" service_state="STOPPED"
-    local remote_summary="未配置" config dst port remote_yaml remote_addr
+    local route_remote="未配置" config dst port
+    local remote_yaml="$INSTALL_BASE/remote/remote.yaml" remote_addr="未配置"
+    local remote_unit="gost-mtcp-remote.service" remote_state="NOT INSTALLED"
     discover_cn_routes
     route_count="${#DISCOVERED_CN_CONFIGS[@]}"
     if (( route_count > 0 )); then
@@ -216,26 +229,30 @@ ui_main_dashboard() {
         main_unit="${main_unit:-gost-mtcp.service}"
         dst="$(read_config_value "$config" DST 2>/dev/null || true)"
         port="$(read_config_value "$config" PORT 2>/dev/null || true)"
-        remote_summary="${dst:-未知}:${port:-未知}"
-        (( route_count > 1 )) && remote_summary+=" (+$((route_count - 1)))"
-    else
-        remote_yaml="$INSTALL_BASE/remote/remote.yaml"
-        if [[ -r "$remote_yaml" ]]; then
-            remote_addr="$(awk '
-                /^- name:[[:space:]]*mtcp-server[[:space:]]*$/ { found=1; next }
-                found && /^  addr:[[:space:]]*/ { sub(/^  addr:[[:space:]]*/, ""); print; exit }
-                found && /^- name:[[:space:]]*/ { exit }
-            ' "$remote_yaml")"
-            remote_summary="本机监听 ${remote_addr:-未知}"
-        fi
+        route_remote="${dst:-未知}:${port:-未知}"
+        (( route_count > 1 )) && route_remote+=" (+$((route_count - 1)))"
     fi
     "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" >/dev/null 2>&1 && service_state="RUNNING"
+
+    if [[ -r "$remote_yaml" ]]; then
+        remote_addr="$(awk '
+            /^- name:[[:space:]]*mtcp-server[[:space:]]*$/ { found=1; next }
+            found && /^  addr:[[:space:]]*/ { sub(/^  addr:[[:space:]]*/, ""); print; exit }
+            found && /^- name:[[:space:]]*/ { exit }
+        ' "$remote_yaml")"
+        remote_addr="${remote_addr:-未知}"
+        remote_state="STOPPED"
+        "$SYSTEMCTL_BIN" is-active --quiet "$remote_unit" >/dev/null 2>&1 && remote_state="RUNNING"
+    fi
 
     ui_header
     echo
     printf '  CN 共享服务 : %s\n' "$(ui_status_badge "$service_state")"
     printf '  已配置线路  : %s\n' "$route_count"
-    printf '  Remote      : %b%s%b\n' "$UI_DIM" "$remote_summary" "$UI_RESET"
+    printf '  线路 Remote : %b%s%b\n' "$UI_DIM" "$route_remote" "$UI_RESET"
+    echo
+    printf '  Remote 服务 : %s\n' "$(ui_status_badge "$remote_state")"
+    printf '  Remote 监听 : %b%s%b\n' "$UI_DIM" "$remote_addr" "$UI_RESET"
     printf '\n  %b────────────────────────────────────────────────────%b\n' "$UI_DIM" "$UI_RESET"
 }
 
@@ -394,11 +411,12 @@ extract_embedded() {
 }
 
 select_install_role() {
-    local output_var="$1" choice role confirm
+    local output_var="$1" choice role confirm redraw=1
     while :; do
-        ui_clear
-        ui_header "安装 / 新增线路"
-        cat <<'MENU'
+        if (( redraw == 1 )); then
+            ui_clear
+            ui_header "安装 / 新增线路"
+            cat <<'MENU'
 
   [1]  CN      中国大陆入口端（接收业务、路径优选）
   [2]  Remote  境外中转端（监听 MTCP、连接后端）
@@ -407,13 +425,15 @@ select_install_role() {
 
   建议先安装 Remote，再安装 CN。
 MENU
+        fi
+        redraw=1
         ui_menu_choice choice "请选择 › " || return 1
         case "$choice" in
             1) role="cn" ;;
             2) role="remote" ;;
             b|B|back|q|Q) return 1 ;;
-            "") continue ;;
-            *) ui_error "无效选择: $choice"; ui_pause "安装菜单"; continue ;;
+            "") redraw=0; continue ;;
+            *) ui_error "无效选择: $choice"; redraw=0; continue ;;
         esac
         ui_menu_choice confirm "确认安装 $role 端？[Y/n] › " || return 1
         case "${confirm:-y}" in
@@ -1905,7 +1925,7 @@ remove_cn_relay() {
 }
 
 manage_cn_relays() {
-    local action="${1:-}" target="${2:-}" route_yaml="${3:-}" route_config="${4:-}" choice
+    local action="${1:-}" target="${2:-}" route_yaml="${3:-}" route_config="${4:-}" choice redraw=1
     check_command awk
     check_command "$SYSTEMCTL_BIN"
 
@@ -1926,24 +1946,27 @@ manage_cn_relays() {
         remove|delete|rm) remove_cn_relay "$target" ;;
         "")
             while :; do
-                ui_clear
-                ui_header "端口转发 · $CN_ROUTE_ID"
-                printf '\n  %b配置: %s%b\n' "$UI_DIM" "$CN_RELAY_YAML" "$UI_RESET"
-                list_cn_relays
-                cat <<'RELAY_MENU'
+                if (( redraw == 1 )); then
+                    ui_clear
+                    ui_header "端口转发 · $CN_ROUTE_ID"
+                    printf '\n  %b配置: %s%b\n' "$UI_DIM" "$CN_RELAY_YAML" "$UI_RESET"
+                    list_cn_relays
+                    cat <<'RELAY_MENU'
   [1]  增加端口转发
   [2]  删除端口转发
   [3]  刷新列表
 
   [B]  返回线路选择
 RELAY_MENU
+                fi
+                redraw=1
                 ui_menu_choice choice "请选择 › " || return 0
                 case "$choice" in
                     1) ui_run_action "新增端口转发" "端口转发" add_cn_relay ;;
                     2) ui_run_action "删除端口转发" "端口转发" remove_cn_relay ;;
                     3) ;;
                     b|B|back|q|Q|quit|exit) return 0 ;;
-                    *) ui_error "无效选择: $choice"; ui_pause "端口转发" ;;
+                    *) ui_error "无效选择: $choice"; redraw=0 ;;
                 esac
             done
             ;;
@@ -1961,7 +1984,7 @@ manage_selected_cn_route() {
 }
 
 view_cn_route_logs() {
-    local route_yaml route_config route event_file status_file choice
+    local route_yaml route_config route event_file status_file choice redraw=1
     select_cn_route route_yaml route_config "请选择要查看状态 / 日志的线路" || return 0
     route="$(read_config_value "$route_config" ROUTE_ID 2>/dev/null || true)"
     [[ -n "$route" ]] || route="$(basename "$(dirname "$route_config")")"
@@ -1971,19 +1994,20 @@ view_cn_route_logs() {
     [[ -n "$status_file" ]] || status_file="$(dirname "$route_config")/state/status.json"
 
     while :; do
-        if (( PATHLOCK_INTERACTIVE_MENU == 1 )); then
-            ui_clear
-            ui_header "状态与日志 · $route"
-        else
+        if (( redraw == 1 )); then
+            if (( PATHLOCK_INTERACTIVE_MENU == 1 )); then
+                ui_clear
+                ui_header "状态与日志 · $route"
+            else
+                echo
+                echo "线路 $route · 状态与日志"
+            fi
             echo
-            echo "线路 $route · 状态与日志"
-        fi
-        echo
-        echo "  当前状态"
-        echo "  ───────────────────────────────────"
-        ui_route_status_panel "$status_file"
-        printf '\n  %b事件: %s%b\n' "$UI_DIM" "$event_file" "$UI_RESET"
-        cat <<'LOG_MENU'
+            echo "  当前状态"
+            echo "  ───────────────────────────────────"
+            ui_route_status_panel "$status_file"
+            printf '\n  %b事件: %s%b\n' "$UI_DIM" "$event_file" "$UI_RESET"
+            cat <<'LOG_MENU'
 
   [1]  最近 50 条事件
   [2]  实时跟踪日志（Ctrl-C 停止）
@@ -1991,6 +2015,8 @@ view_cn_route_logs() {
 
   [B]  返回主菜单
 LOG_MENU
+        fi
+        redraw=1
         ui_menu_choice choice "请选择 › " || return 0
         case "$choice" in
             1)
@@ -2004,7 +2030,7 @@ LOG_MENU
             2)
                 if [[ -r "$event_file" ]]; then
                     ui_warn "正在跟踪 ${event_file}，按 Ctrl-C 返回"
-                    tail -n 20 -f "$event_file" || true
+                    ui_follow_log "$event_file"
                 else
                     ui_error "日志尚未生成: $event_file"
                 fi
@@ -2019,18 +2045,19 @@ LOG_MENU
                 ui_pause "状态与日志"
                 ;;
             b|B|back|q|Q|quit|exit) return 0 ;;
-            *) ui_error "无效选择: $choice"; ui_pause "状态与日志" ;;
+            *) ui_error "无效选择: $choice"; redraw=0 ;;
         esac
     done
 }
 
 interactive_main_menu() {
-    local choice install_role
+    local choice install_role redraw=1
     ui_init
     while :; do
-        ui_clear
-        ui_main_dashboard
-        cat <<'MAIN_MENU'
+        if (( redraw == 1 )); then
+            ui_clear
+            ui_main_dashboard
+            cat <<'MAIN_MENU'
 
   [1]  安装 / 新增线路
   [2]  查看线路与端口
@@ -2039,6 +2066,8 @@ interactive_main_menu() {
 
   [Q]  退出
 MAIN_MENU
+        fi
+        redraw=1
         ui_menu_choice choice "请选择操作 › " || return 0
         case "$choice" in
             1)
@@ -2054,8 +2083,8 @@ MAIN_MENU
             3) manage_selected_cn_route ;;
             4) view_cn_route_logs ;;
             q|Q|quit|exit) ui_success "已退出"; return 0 ;;
-            "") ;;
-            *) ui_error "无效选择: $choice"; ui_pause "主菜单" ;;
+            "") redraw=0 ;;
+            *) ui_error "无效选择: $choice"; redraw=0 ;;
         esac
     done
 }

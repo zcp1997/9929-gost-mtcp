@@ -389,6 +389,30 @@ LEGACY
     printf '%s\n' '{"state":"FAST","reason":"PATH","route":"jp","minrtt_ms":"33.2","rtt_ms":"34.8","outer_count":1,"remote_reachable":"yes","data_plane_reachable":"yes","business_connections":0}' \
         > "$jp/state/status.json"
     printf '%s\n' '{"event":"PREWARM_SUCCESS","route":"jp"}' > "$jp/state/events.jsonl"
+    tail_mock_dir="$integration_dir/tail-mock"
+    mkdir -p "$tail_mock_dir"
+    cat > "$tail_mock_dir/tail" <<'MOCK'
+#!/usr/bin/env bash
+kill -INT "$UI_TAIL_PARENT"
+sleep 2
+: > "$UI_TAIL_LEAK"
+MOCK
+    chmod +x "$tail_mock_dir/tail"
+    tail_follow_output="$integration_dir/tail-follow.out"
+    tail_leak="$integration_dir/tail-follow.leak"
+    set +e
+    PATH="$tail_mock_dir:$PATH" UI_TAIL_LEAK="$tail_leak" bash -c '
+      source "$1"
+      export UI_TAIL_PARENT=$$
+      ui_init
+      ui_follow_log "$2"
+      echo manager-survived
+    ' _ "$integration_dir/core.sh" "$jp/state/events.jsonl" >"$tail_follow_output" 2>&1
+    tail_follow_rc=$?
+    set -e
+    (( tail_follow_rc == 0 )) && [[ ! -e "$tail_leak" ]] && grep -q 'manager-survived' "$tail_follow_output" || \
+        fail "Ctrl-C from tail -f escaped or terminated the standalone manager"
+
     PROMPTS=(1 1 b); PROMPT_INDEX=0
     log_output="$(view_cn_route_logs)"
     [[ "$log_output" == *'"event":"PREWARM_SUCCESS"'* && "$log_output" == *"minRTT"* && \
@@ -400,6 +424,11 @@ LEGACY
        "$main_menu_output" == *"[1]  安装 / 新增线路"* && \
        "$main_menu_output" == *"线路 jp"* && "$main_menu_output" == *"已退出"* ]] || \
         fail "top-level management dashboard did not dispatch configuration listing"
+    PROMPTS=(invalid q); PROMPT_INDEX=0
+    invalid_menu_output="$integration_dir/invalid-menu.out"
+    interactive_main_menu >"$invalid_menu_output" 2>&1
+    [[ "$PROMPT_INDEX" == 2 ]] && grep -q '无效选择: invalid' "$invalid_menu_output" || \
+        fail "invalid menu choice still requires an extra Enter"
     PATHLOCK_INTERACTIVE_MENU=0
 
     set +e
@@ -513,13 +542,18 @@ LEGACY
         "$SYSTEMD_DIR/gost-mtcp-remote.service" || fail "Remote unit render failed"
     grep -Fq "ExecStart=$integration_dir/bin/socat " "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service" || \
         fail "Remote endpoint unit did not use detected socat"
+    ui_init
+    remote_dashboard="$(ui_main_dashboard)"
+    [[ "$remote_dashboard" == *"Remote 服务 : ● RUNNING"* && \
+       "$remote_dashboard" == *"Remote 监听 : :45200"* ]] || \
+        fail "main dashboard does not show the installed Remote service and listener"
     set +e
     ( PROMPTS=(); PROMPT_INDEX=0; install_remote >/dev/null 2>&1 )
     remote_reinstall_rc=$?
     set -e
     (( remote_reinstall_rc != 0 )) || fail "active Remote reinstall was not refused"
 )
-pass "standalone CLI renders dashboards, retries input, and preserves route isolation and rollback"
+pass "standalone CLI handles CN/Remote dashboards, input retry, Ctrl-C logs, isolation, and rollback"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/mtcp-tests.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
