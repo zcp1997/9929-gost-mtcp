@@ -18,6 +18,87 @@ for fragment in "$@"; do
     }
     [[ "$seen_routes" != *" $route "* ]] || { echo "duplicate route id: $route" >&2; exit 1; }
     seen_routes+="$route "
+
+    # Fragment 是线路故障域的边界：它只能定义并引用自己的 chain，且必须
+    # 包含本线路唯一的 Anchor。不能仅因聚合配置里存在另一线路的 chain 就放行。
+    awk -v route="$route" -v source="$fragment" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        function fail(message) {
+            printf "%s: %s\n", source, message > "/dev/stderr"
+            failed = 1
+        }
+        function finish_service() {
+            if (current_service == "") return
+            if (service_chain_count != 1) {
+                fail("service " current_service " must reference exactly one " expected_chain)
+            }
+            current_service = ""
+            service_chain_count = 0
+        }
+        BEGIN {
+            expected_chain = "chain-mtcp-" route
+            expected_anchor = "mtcp-anchor-" route
+        }
+        /^services:[[:space:]]*$/ {
+            finish_service()
+            section = "services"
+            services_sections++
+            next
+        }
+        /^chains:[[:space:]]*$/ {
+            finish_service()
+            section = "chains"
+            chains_sections++
+            next
+        }
+        section == "services" && /^- name:[[:space:]]*/ {
+            finish_service()
+            value = $0
+            sub(/^- name:[[:space:]]*/, "", value)
+            current_service = trim(value)
+            service_count++
+            if (current_service == expected_anchor) anchor_count++
+            next
+        }
+        section == "services" && current_service != "" && /^[[:space:]]+chain:[[:space:]]*/ {
+            value = $0
+            sub(/^[[:space:]]+chain:[[:space:]]*/, "", value)
+            value = trim(value)
+            service_chain_count++
+            if (value != expected_chain) {
+                fail("service " current_service " references foreign chain " value "; expected " expected_chain)
+            }
+            next
+        }
+        section == "chains" && /^- name:[[:space:]]*/ {
+            value = $0
+            sub(/^- name:[[:space:]]*/, "", value)
+            value = trim(value)
+            chain_count++
+            if (value == expected_chain) {
+                expected_chain_count++
+            } else {
+                fail("fragment defines foreign chain " value "; expected " expected_chain)
+            }
+            next
+        }
+        END {
+            finish_service()
+            if (services_sections != 1 || chains_sections != 1) {
+                fail("must contain exactly one services section and one chains section")
+            }
+            if (service_count == 0) fail("contains no services")
+            if (anchor_count != 1) fail("must contain exactly one " expected_anchor)
+            if (chain_count != 1 || expected_chain_count != 1) {
+                fail("must define exactly one " expected_chain)
+            }
+            exit failed
+        }
+    ' "$fragment" || exit 1
 done
 
 output_dir="$(dirname "$OUTPUT")"

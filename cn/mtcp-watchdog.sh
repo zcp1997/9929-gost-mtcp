@@ -31,6 +31,16 @@ fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
+# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在 /run 并由
+# UNIT 派生出的全局锁保护；这里的内存值只是共享文件的当前快照。
+PROCESS_RECOVERY_LOCK_FILE=""
+PROCESS_RECOVERY_STATE_FILE=""
+PROCESS_RECOVERY_EPOCHS=""
+PROCESS_BREAKER_STATE="closed"
+PROCESS_BREAKER_UNTIL=0
+PROCESS_BREAKER_LOGGED=0
+LAST_PROCESS_RECOVERY=0
+
 reset_data_probe_state() {
     LAST_DATA_PROBE=0
     DATA_PROBE_FAILS=0
@@ -47,9 +57,7 @@ reset_runtime_state() {
     BUSINESS_IDLE_SINCE=0
     DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
     DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
-    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
-    LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
+    PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     reset_data_probe_state
     HAVE_RUNTIME=0
 }
@@ -82,11 +90,6 @@ load_runtime_state() {
     : "${DATA_PROBE_BREAKER_STATE:=closed}"
     : "${DATA_PROBE_BREAKER_UNTIL:=0}"
     : "${DATA_PROBE_BREAKER_LOGGED:=0}"
-    : "${PROCESS_RECOVERY_EPOCHS:=}"
-    : "${PROCESS_BREAKER_STATE:=closed}"
-    : "${PROCESS_BREAKER_UNTIL:=0}"
-    : "${PROCESS_BREAKER_LOGGED:=0}"
-    : "${LAST_PROCESS_RECOVERY:=0}"
     : "${PROCESS_HEALTHY_SINCE:=0}"
     : "${PROCESS_DOWN_SINCE:=0}"
     if [[ ! "$LAST_DATA_PROBE" =~ ^[0-9]+$ || ! "$DATA_PROBE_FAILS" =~ ^[0-9]+$ ]] ||
@@ -95,18 +98,14 @@ load_runtime_state() {
         reset_data_probe_state
     fi
     if [[ ! "$BUSINESS_IDLE_SINCE" =~ ^[0-9]+$ || ! "$DATA_PROBE_BREAKER_UNTIL" =~ ^[0-9]+$ ||
-          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ || ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
-          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ || ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ||
+          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ ||
           ! "$PROCESS_HEALTHY_SINCE" =~ ^[0-9]+$ || ! "$PROCESS_DOWN_SINCE" =~ ^[0-9]+$ ]] ||
-       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] || "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
-       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]] ||
-       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]]; then
         BUSINESS_IDLE_SINCE=0
         DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
         DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
-        PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-        PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
-        LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
+        PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     fi
     HAVE_RUNTIME=1
     return 0
@@ -142,11 +141,6 @@ DATA_PROBE_RESTART_EPOCHS='$DATA_PROBE_RESTART_EPOCHS'
 DATA_PROBE_BREAKER_STATE='$DATA_PROBE_BREAKER_STATE'
 DATA_PROBE_BREAKER_UNTIL='$DATA_PROBE_BREAKER_UNTIL'
 DATA_PROBE_BREAKER_LOGGED='$DATA_PROBE_BREAKER_LOGGED'
-PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
-PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
-PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
-PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
-LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
 PROCESS_HEALTHY_SINCE='$PROCESS_HEALTHY_SINCE'
 PROCESS_DOWN_SINCE='$PROCESS_DOWN_SINCE'
 STATEEOF
@@ -159,6 +153,75 @@ prune_epoch_list() {
         (( epoch >= cutoff )) && kept="${kept:+$kept }$epoch"
     done
     printf '%s\n' "$kept"
+}
+
+init_process_recovery_paths() {
+    local shared_id runtime_dir
+    shared_id="${UNIT%.service}"
+    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
+    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-/run}"
+    [[ -d "$runtime_dir" ]] || mkdir -p "$runtime_dir" || return 1
+    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}-process-recovery.lock"
+    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}-process-recovery.state"
+}
+
+reset_process_recovery_state() {
+    PROCESS_RECOVERY_EPOCHS=""
+    PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0
+    PROCESS_BREAKER_LOGGED=0
+    LAST_PROCESS_RECOVERY=0
+}
+
+load_process_recovery_state() {
+    local process_state_boot_id=""
+    reset_process_recovery_state
+    [[ -n "$PROCESS_RECOVERY_STATE_FILE" && -r "$PROCESS_RECOVERY_STATE_FILE" ]] || return 1
+
+    process_state_boot_id="$(awk -F"'" 'NR == 1 && $1 == "PROCESS_STATE_BOOT_ID=" { print $2; exit }' \
+        "$PROCESS_RECOVERY_STATE_FILE" 2>/dev/null || true)"
+    [[ -n "$process_state_boot_id" && "$process_state_boot_id" == "$BOOT_ID" ]] || return 1
+
+    # /run 下的文件由 root Watchdog 以 0600 原子写入，内容只包含下列受校验字段。
+    # shellcheck disable=SC1090
+    if ! source "$PROCESS_RECOVERY_STATE_FILE"; then
+        reset_process_recovery_state
+        return 1
+    fi
+    if [[ "${PROCESS_STATE_BOOT_ID:-}" != "$BOOT_ID" ||
+          ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ ||
+          ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ]] ||
+       [[ "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+        reset_process_recovery_state
+        return 1
+    fi
+    return 0
+}
+
+save_process_recovery_state() {
+    local runtime_dir tmp
+    runtime_dir="$(dirname "$PROCESS_RECOVERY_STATE_FILE")"
+    mkdir -p "$runtime_dir" || return 1
+    umask 077
+    tmp="$(mktemp "${PROCESS_RECOVERY_STATE_FILE}.tmp.XXXXXX")" || return 1
+    if ! cat > "$tmp" <<STATEEOF
+PROCESS_STATE_BOOT_ID='$BOOT_ID'
+PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
+PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
+PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
+PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
+LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
+STATEEOF
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$PROCESS_RECOVERY_STATE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 close_data_probe_breaker() {
@@ -215,11 +278,41 @@ allow_data_probe_restart() {
 }
 
 close_process_breaker() {
-    if [[ "$PROCESS_BREAKER_STATE" != "closed" || -n "$PROCESS_RECOVERY_EPOCHS" ]]; then
-        log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    local now="${1:-$(now_epoch)}"
+    init_process_recovery_paths || return 1
+    # fd 9 专用于短生命周期的共享 PROCESS lock；启动时的 route lock 由
+    # Bash 动态分配到 >=10，不会与它冲突。
+    exec 9>"$PROCESS_RECOVERY_LOCK_FILE" || return 1
+    if ! flock -n 9; then
+        exec 9>&-
+        return 1
     fi
-    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0; LAST_PROCESS_RECOVERY=0
+
+    # 只允许已持续健康的调用方关闭共享 breaker；同时要求最后一次全局
+    # recovery 已经过完整 interval，避免漏看短暂 DOWN 的线路过早清空预算。
+    if ! service_is_active || (( $(get_main_pid) <= 0 )); then
+        exec 9>&-
+        return 1
+    fi
+    load_process_recovery_state || true
+    if [[ "$PROCESS_BREAKER_STATE" == "closed" && -z "$PROCESS_RECOVERY_EPOCHS" ]]; then
+        exec 9>&-
+        return 0
+    fi
+    if (( LAST_PROCESS_RECOVERY > 0 && now - LAST_PROCESS_RECOVERY < PROCESS_RECOVERY_INTERVAL_SEC )); then
+        exec 9>&-
+        return 1
+    fi
+
+    log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    reset_process_recovery_state
+    if ! save_process_recovery_state; then
+        log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+        exec 9>&-
+        return 2
+    fi
+    exec 9>&-
+    return 0
 }
 
 allow_process_recovery() {
@@ -268,33 +361,49 @@ allow_process_recovery() {
 }
 
 recover_process_rate_limited() {
-    local now="$1" shared_id shared_lock
-    allow_process_recovery "$now" || return 1
-    shared_id="${UNIT%.service}"
-    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
-    shared_lock="/run/${shared_id}-process-recovery.lock"
-    exec {PROCESS_LOCK_FD}>"$shared_lock"
-    if ! flock -n "$PROCESS_LOCK_FD"; then
-        exec {PROCESS_LOCK_FD}>&-
+    local now="$1"
+    init_process_recovery_paths || return 2
+    exec 9>"$PROCESS_RECOVERY_LOCK_FILE" || return 2
+    if ! flock -n 9; then
+        exec 9>&-
         return 1
     fi
 
-    # 多条线路的 Watchdog 共享同一个 GOST。拿到全局锁后必须复查，避免它们
-    # 在同一轮同时 restart 公共进程。
+    # 锁内按顺序完成复查、共享状态读取、预算判断、attempt 落盘和 restart。
+    # 因此后拿锁的其他线路会看到同一份 interval/window/max 预算，而不只是
+    # 被阻止并发 restart。
     if service_is_active && (( $(get_main_pid) > 0 )); then
-        exec {PROCESS_LOCK_FD}>&-
+        exec 9>&-
         return 0
     fi
+    load_process_recovery_state || true
+    if ! allow_process_recovery "$now"; then
+        if ! save_process_recovery_state; then
+            log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" 0
+            exec 9>&-
+            return 2
+        fi
+        exec 9>&-
+        return 1
+    fi
+    # attempt 必须先持久化再执行 restart；即使 restart 失败或 Watchdog 被终止，
+    # 下一条线路也不能拿到一套新的预算。
+    if ! save_process_recovery_state; then
+        log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" 0
+        exec 9>&-
+        return 2
+    fi
+
     log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
         "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
     if ! systemctl restart "$UNIT"; then
         log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
-        exec {PROCESS_LOCK_FD}>&-
+        exec 9>&-
         return 2
     fi
     log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
-    exec {PROCESS_LOCK_FD}>&-
+    exec 9>&-
     return 0
 }
 
@@ -418,15 +527,21 @@ adopt_current() {
     save_runtime_state
 }
 
+init_process_recovery_paths || { echo "cannot initialize shared PROCESS recovery state" >&2; exit 1; }
+load_process_recovery_state || true
 if (( ADOPT_MODE == 1 )); then
     adopt_current
     exit $?
 fi
 
 load_runtime_state || true
+# 兼容升级前 route-local runtime.state 中残留的 PROCESS_* 字段；共享快照优先。
+load_process_recovery_state || true
 
 while true; do
     load_config "$CONFIG" || { sleep 5; continue; }
+    init_process_recovery_paths || { sleep 5; continue; }
+    load_process_recovery_state || true
     now="$(now_epoch)"
     if (( now - LAST_PRUNE >= 3600 )); then prune_events; LAST_PRUNE="$now"; fi
 
@@ -442,9 +557,13 @@ while true; do
         set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
         if (( now - PROCESS_DOWN_SINCE >= PROCESS_RECOVERY_GRACE_SEC )); then
             recover_process_rate_limited "$now" || true
+            # 非持锁线路也立即读取 winner 已写入的 attempt/breaker 快照。
+            load_process_recovery_state || true
         fi
         if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
             set_state "FAULT" "PROCESS_BREAKER" "$pid" "" "" "" 0
+        else
+            set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -454,7 +573,7 @@ while true; do
     if (( PROCESS_HEALTHY_SINCE == 0 )); then
         PROCESS_HEALTHY_SINCE="$now"
     elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
-        close_process_breaker
+        close_process_breaker "$now" || true
     fi
 
     # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。

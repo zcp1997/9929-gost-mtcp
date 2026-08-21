@@ -493,7 +493,8 @@ render_cn_route_yaml() {
 }
 
 compile_cn_runtime_candidate() {
-    local cn_dir="$1" target_fragment="$2" candidate_fragment="$3" output="$4" path found=0
+    local cn_dir="$1" target_fragment="$2" candidate_fragment="$3" output="$4"
+    local compiler="${5:-$cn_dir/compile-config.sh}" path found=0
     local -a fragments=()
 
     for path in "$cn_dir"/instances/*/cn.yaml; do
@@ -509,20 +510,26 @@ compile_cn_runtime_candidate() {
     done
     (( found == 1 )) || fragments+=("$candidate_fragment")
     (( ${#fragments[@]} > 0 )) || die "没有可编译的 CN 线路配置"
-    "$cn_dir/compile-config.sh" "$output" "${fragments[@]}"
+    [[ -x "$compiler" ]] || die "CN 配置编译器不可执行: $compiler"
+    "$compiler" "$output" "${fragments[@]}"
 }
 
 stop_cn_route_controls() {
-    local cn_dir="$1" config anchor watchdog
+    local cn_dir="$1" strict="${2:-0}" config anchor watchdog failed=0
     for config in "$cn_dir"/instances/*/mtcp.conf; do
         [[ -r "$config" ]] || continue
         anchor="$(read_config_value "$config" ANCHOR_UNIT 2>/dev/null || true)"
         watchdog="$(read_config_value "$config" WATCHDOG_UNIT 2>/dev/null || true)"
-        [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] && \
-            "$SYSTEMCTL_BIN" stop "$watchdog" >/dev/null 2>&1 || true
-        [[ "$anchor" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] && \
-            "$SYSTEMCTL_BIN" stop "$anchor" >/dev/null 2>&1 || true
+        if [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] &&
+           ! "$SYSTEMCTL_BIN" stop "$watchdog" >/dev/null 2>&1; then
+            if (( strict == 1 )); then failed=1; fi
+        fi
+        if [[ "$anchor" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] &&
+           ! "$SYSTEMCTL_BIN" stop "$anchor" >/dev/null 2>&1; then
+            if (( strict == 1 )); then failed=1; fi
+        fi
     done
+    (( failed == 0 ))
 }
 
 cn_active_business_count() {
@@ -691,8 +698,8 @@ install_cn() {
     local anchor_service chain_name
     local yaml_template yaml_tmp conf_tmp auth_tmp runtime_tmp compile_tmp
     local lib_tmp prewarm_tmp watchdog_tmp main_tmp anchor_tmp watchdog_unit_tmp
-    local business_ports legacy_unit config other_dst other_port migration_stamp
-    local backup_dir restart_ok=0
+    local business_ports legacy_unit config other_dst other_port migration_stamp candidate_script
+    local shared_stage backup_dir restart_ok=0
 
     cn_dir="$INSTALL_BASE/cn"
     runtime_yaml="$cn_dir/runtime.yaml"
@@ -760,23 +767,24 @@ install_cn() {
     ensure_cn_port_available "$anchor_port" "$instance_dir/mtcp.conf" "$main_unit" "$legacy_main_unit"
     require_cn_restart_window "$cn_dir" "$main_unit"
 
-    download_gost cn "$cn_dir"
+    # GOST 与所有公共脚本先进入隔离 staging。正式路径在候选 runtime、units、
+    # shell 语法和真实 GOST 解析全部通过前保持不变，避免 old process + new files。
+    shared_stage="$(mktemp -d "$cn_dir/.shared-candidate.XXXXXX")"
+    CLEANUP_PATHS+=("$shared_stage")
+    download_gost cn "$shared_stage"
 
-    # 公共脚本先原子更新；compile-config.sh 是所有线路聚合配置的唯一生成器。
-    lib_tmp="$(mktemp "$cn_dir/.mtcp-lib.XXXXXX")"
-    prewarm_tmp="$(mktemp "$cn_dir/.mtcp-prewarm.XXXXXX")"
-    watchdog_tmp="$(mktemp "$cn_dir/.mtcp-watchdog.XXXXXX")"
-    compile_tmp="$(mktemp "$cn_dir/.compile-config.XXXXXX")"
-    CLEANUP_PATHS+=("$lib_tmp" "$prewarm_tmp" "$watchdog_tmp" "$compile_tmp")
+    lib_tmp="$shared_stage/mtcp-lib.sh"
+    prewarm_tmp="$shared_stage/mtcp-prewarm.sh"
+    watchdog_tmp="$shared_stage/mtcp-watchdog.sh"
+    compile_tmp="$shared_stage/compile-config.sh"
     extract_embedded CN_LIB | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$lib_tmp"
     extract_embedded CN_PREWARM | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$prewarm_tmp"
     extract_embedded CN_WATCHDOG | sed "s|/root/gost-ecmp-pathlock/cn|$cn_dir|g" > "$watchdog_tmp"
     extract_embedded CN_COMPILE > "$compile_tmp"
     chmod 0755 "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp" "$compile_tmp"
-    mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh"
-    mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh"
-    mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh"
-    mv -f "$compile_tmp" "$cn_dir/compile-config.sh"
+    for candidate_script in "$lib_tmp" "$prewarm_tmp" "$watchdog_tmp" "$compile_tmp"; do
+        bash -n "$candidate_script" || die "候选 CN 公共脚本未通过 shell 语法校验: $candidate_script"
+    done
 
     yaml_template="$(mktemp "$instance_dir/.cn.template.XXXXXX")"
     yaml_tmp="$(mktemp "$instance_dir/.cn.yaml.XXXXXX")"
@@ -831,9 +839,11 @@ install_cn() {
     ' > "$conf_tmp" || die "canonical CN Watchdog 配置结构不符合预期"
     chmod 0644 "$yaml_tmp" "$conf_tmp"
 
-    compile_cn_runtime_candidate "$cn_dir" "$instance_dir/cn.yaml" "$yaml_tmp" "$runtime_tmp" || \
-        die "无法生成共享 GOST 配置；请检查线路名称、监听端口和 chain 是否冲突"
-    "$cn_dir/gost" -C "$runtime_tmp" -O yaml >/dev/null || die "共享 GOST 配置未通过 GOST 解析校验"
+    compile_cn_runtime_candidate "$cn_dir" "$instance_dir/cn.yaml" "$yaml_tmp" "$runtime_tmp" \
+        "$compile_tmp" || \
+        die "无法生成共享 GOST 配置；请检查线路归属、名称、监听端口和 chain 是否冲突"
+    "$shared_stage/gost" -C "$runtime_tmp" -O yaml >/dev/null || \
+        die "共享 GOST 配置未通过候选 GOST 解析校验"
 
     main_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp.XXXXXX")"
     anchor_tmp="$(mktemp "$SYSTEMD_DIR/.${route_prefix}-anchor.XXXXXX")"
@@ -875,6 +885,11 @@ install_cn() {
             rm -f "$path"
         fi
     }
+    backup_one "$cn_dir/gost" shared-gost
+    backup_one "$cn_dir/mtcp-lib.sh" shared-lib
+    backup_one "$cn_dir/mtcp-prewarm.sh" shared-prewarm
+    backup_one "$cn_dir/mtcp-watchdog.sh" shared-watchdog
+    backup_one "$cn_dir/compile-config.sh" shared-compiler
     backup_one "$instance_dir/cn.yaml" route-yaml
     backup_one "$instance_dir/mtcp.conf" route-conf
     backup_one "$auth_file" route-auth
@@ -884,14 +899,27 @@ install_cn() {
     backup_one "$SYSTEMD_DIR/$watchdog_unit" watchdog-unit
 
     echo "正在停止各线路控制单元并重启唯一共享 GOST；现有线路连接会中断。"
-    stop_cn_route_controls "$cn_dir"
-    if ! mv -f "$auth_tmp" "$auth_file" ||
+    if ! stop_cn_route_controls "$cn_dir" 1; then
+        start_cn_route_watchdogs "$cn_dir" >/dev/null 2>&1 || true
+        die "无法停止全部线路控制单元；正式 shared artifacts 尚未修改"
+    fi
+    if ! mv -f "$shared_stage/gost" "$cn_dir/gost" ||
+       ! mv -f "$lib_tmp" "$cn_dir/mtcp-lib.sh" ||
+       ! mv -f "$prewarm_tmp" "$cn_dir/mtcp-prewarm.sh" ||
+       ! mv -f "$watchdog_tmp" "$cn_dir/mtcp-watchdog.sh" ||
+       ! mv -f "$compile_tmp" "$cn_dir/compile-config.sh" ||
+       ! mv -f "$auth_tmp" "$auth_file" ||
        ! mv -f "$yaml_tmp" "$instance_dir/cn.yaml" ||
        ! mv -f "$conf_tmp" "$instance_dir/mtcp.conf" ||
        ! mv -f "$runtime_tmp" "$runtime_yaml" ||
        ! mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit" ||
        ! mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit" ||
        ! mv -f "$watchdog_unit_tmp" "$SYSTEMD_DIR/$watchdog_unit"; then
+        restore_one "$cn_dir/gost" shared-gost
+        restore_one "$cn_dir/mtcp-lib.sh" shared-lib
+        restore_one "$cn_dir/mtcp-prewarm.sh" shared-prewarm
+        restore_one "$cn_dir/mtcp-watchdog.sh" shared-watchdog
+        restore_one "$cn_dir/compile-config.sh" shared-compiler
         restore_one "$instance_dir/cn.yaml" route-yaml
         restore_one "$instance_dir/mtcp.conf" route-conf
         restore_one "$auth_file" route-auth
@@ -902,7 +930,7 @@ install_cn() {
         "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
         "$SYSTEMCTL_BIN" restart "$main_unit" >/dev/null 2>&1 || true
         start_cn_route_watchdogs "$cn_dir" >/dev/null 2>&1 || true
-        die "无法替换共享 CN 配置；已尝试恢复原状态"
+        die "无法提交共享 CN artifacts 与配置；已尝试恢复原状态"
     fi
 
     "$SYSTEMCTL_BIN" daemon-reload
@@ -913,8 +941,13 @@ install_cn() {
     fi
 
     if (( restart_ok != 1 )); then
-        echo "共享 GOST 更新失败，正在回滚线路、聚合配置和 systemd unit。" >&2
+        echo "共享 GOST 更新失败，正在回滚 binary、公共脚本、线路、聚合配置和 systemd unit。" >&2
         stop_cn_route_controls "$cn_dir"
+        restore_one "$cn_dir/gost" shared-gost
+        restore_one "$cn_dir/mtcp-lib.sh" shared-lib
+        restore_one "$cn_dir/mtcp-prewarm.sh" shared-prewarm
+        restore_one "$cn_dir/mtcp-watchdog.sh" shared-watchdog
+        restore_one "$cn_dir/compile-config.sh" shared-compiler
         restore_one "$instance_dir/cn.yaml" route-yaml
         restore_one "$instance_dir/mtcp.conf" route-conf
         restore_one "$auth_file" route-auth
@@ -925,7 +958,7 @@ install_cn() {
         "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
         "$SYSTEMCTL_BIN" restart "$main_unit" >/dev/null 2>&1 || true
         start_cn_route_watchdogs "$cn_dir" >/dev/null 2>&1 || true
-        die "共享 GOST 更新未生效，已尝试恢复原配置"
+        die "共享 GOST 更新未生效，已尝试恢复整套旧 artifacts 与配置"
     fi
 
     if [[ "$legacy_main_unit" != "$main_unit" ]]; then
@@ -1930,6 +1963,8 @@ STUCK_RESTART_AFTER_SEC="60"
 RESTART_COOLDOWN_SEC="60"
 MULTI_CONFIRM_COUNT="2"
 # GOST 因 systemd StartLimit 等原因停止时，低频尝试 reset-failed + restart。
+# PROCESS breaker/budget 属于共享 UNIT，状态写入 /run/gost-mtcp-process-recovery.state；
+# 所有线路使用同一套默认参数，安装器生成的实例会保持一致。
 PROCESS_RECOVERY_GRACE_SEC="10"
 PROCESS_RECOVERY_INTERVAL_SEC="60"
 PROCESS_RECOVERY_WINDOW_SEC="600"
@@ -1966,6 +2001,87 @@ for fragment in "$@"; do
     }
     [[ "$seen_routes" != *" $route "* ]] || { echo "duplicate route id: $route" >&2; exit 1; }
     seen_routes+="$route "
+
+    # Fragment 是线路故障域的边界：它只能定义并引用自己的 chain，且必须
+    # 包含本线路唯一的 Anchor。不能仅因聚合配置里存在另一线路的 chain 就放行。
+    awk -v route="$route" -v source="$fragment" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        function fail(message) {
+            printf "%s: %s\n", source, message > "/dev/stderr"
+            failed = 1
+        }
+        function finish_service() {
+            if (current_service == "") return
+            if (service_chain_count != 1) {
+                fail("service " current_service " must reference exactly one " expected_chain)
+            }
+            current_service = ""
+            service_chain_count = 0
+        }
+        BEGIN {
+            expected_chain = "chain-mtcp-" route
+            expected_anchor = "mtcp-anchor-" route
+        }
+        /^services:[[:space:]]*$/ {
+            finish_service()
+            section = "services"
+            services_sections++
+            next
+        }
+        /^chains:[[:space:]]*$/ {
+            finish_service()
+            section = "chains"
+            chains_sections++
+            next
+        }
+        section == "services" && /^- name:[[:space:]]*/ {
+            finish_service()
+            value = $0
+            sub(/^- name:[[:space:]]*/, "", value)
+            current_service = trim(value)
+            service_count++
+            if (current_service == expected_anchor) anchor_count++
+            next
+        }
+        section == "services" && current_service != "" && /^[[:space:]]+chain:[[:space:]]*/ {
+            value = $0
+            sub(/^[[:space:]]+chain:[[:space:]]*/, "", value)
+            value = trim(value)
+            service_chain_count++
+            if (value != expected_chain) {
+                fail("service " current_service " references foreign chain " value "; expected " expected_chain)
+            }
+            next
+        }
+        section == "chains" && /^- name:[[:space:]]*/ {
+            value = $0
+            sub(/^- name:[[:space:]]*/, "", value)
+            value = trim(value)
+            chain_count++
+            if (value == expected_chain) {
+                expected_chain_count++
+            } else {
+                fail("fragment defines foreign chain " value "; expected " expected_chain)
+            }
+            next
+        }
+        END {
+            finish_service()
+            if (services_sections != 1 || chains_sections != 1) {
+                fail("must contain exactly one services section and one chains section")
+            }
+            if (service_count == 0) fail("contains no services")
+            if (anchor_count != 1) fail("must contain exactly one " expected_anchor)
+            if (chain_count != 1 || expected_chain_count != 1) {
+                fail("must define exactly one " expected_chain)
+            }
+            exit failed
+        }
+    ' "$fragment" || exit 1
 done
 
 output_dir="$(dirname "$OUTPUT")"
@@ -2744,6 +2860,16 @@ fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
+# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在 /run 并由
+# UNIT 派生出的全局锁保护；这里的内存值只是共享文件的当前快照。
+PROCESS_RECOVERY_LOCK_FILE=""
+PROCESS_RECOVERY_STATE_FILE=""
+PROCESS_RECOVERY_EPOCHS=""
+PROCESS_BREAKER_STATE="closed"
+PROCESS_BREAKER_UNTIL=0
+PROCESS_BREAKER_LOGGED=0
+LAST_PROCESS_RECOVERY=0
+
 reset_data_probe_state() {
     LAST_DATA_PROBE=0
     DATA_PROBE_FAILS=0
@@ -2760,9 +2886,7 @@ reset_runtime_state() {
     BUSINESS_IDLE_SINCE=0
     DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
     DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
-    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
-    LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
+    PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     reset_data_probe_state
     HAVE_RUNTIME=0
 }
@@ -2795,11 +2919,6 @@ load_runtime_state() {
     : "${DATA_PROBE_BREAKER_STATE:=closed}"
     : "${DATA_PROBE_BREAKER_UNTIL:=0}"
     : "${DATA_PROBE_BREAKER_LOGGED:=0}"
-    : "${PROCESS_RECOVERY_EPOCHS:=}"
-    : "${PROCESS_BREAKER_STATE:=closed}"
-    : "${PROCESS_BREAKER_UNTIL:=0}"
-    : "${PROCESS_BREAKER_LOGGED:=0}"
-    : "${LAST_PROCESS_RECOVERY:=0}"
     : "${PROCESS_HEALTHY_SINCE:=0}"
     : "${PROCESS_DOWN_SINCE:=0}"
     if [[ ! "$LAST_DATA_PROBE" =~ ^[0-9]+$ || ! "$DATA_PROBE_FAILS" =~ ^[0-9]+$ ]] ||
@@ -2808,18 +2927,14 @@ load_runtime_state() {
         reset_data_probe_state
     fi
     if [[ ! "$BUSINESS_IDLE_SINCE" =~ ^[0-9]+$ || ! "$DATA_PROBE_BREAKER_UNTIL" =~ ^[0-9]+$ ||
-          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ || ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
-          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ || ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ||
+          ! "$DATA_PROBE_BREAKER_LOGGED" =~ ^[01]$ ||
           ! "$PROCESS_HEALTHY_SINCE" =~ ^[0-9]+$ || ! "$PROCESS_DOWN_SINCE" =~ ^[0-9]+$ ]] ||
-       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] || "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
-       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]] ||
-       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+       [[ "$DATA_PROBE_RESTART_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$DATA_PROBE_BREAKER_STATE" != "closed" && "$DATA_PROBE_BREAKER_STATE" != "open" ]]; then
         BUSINESS_IDLE_SINCE=0
         DATA_PROBE_RESTART_EPOCHS=""; DATA_PROBE_BREAKER_STATE="closed"
         DATA_PROBE_BREAKER_UNTIL=0; DATA_PROBE_BREAKER_LOGGED=0
-        PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-        PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0
-        LAST_PROCESS_RECOVERY=0; PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
+        PROCESS_HEALTHY_SINCE=0; PROCESS_DOWN_SINCE=0
     fi
     HAVE_RUNTIME=1
     return 0
@@ -2855,11 +2970,6 @@ DATA_PROBE_RESTART_EPOCHS='$DATA_PROBE_RESTART_EPOCHS'
 DATA_PROBE_BREAKER_STATE='$DATA_PROBE_BREAKER_STATE'
 DATA_PROBE_BREAKER_UNTIL='$DATA_PROBE_BREAKER_UNTIL'
 DATA_PROBE_BREAKER_LOGGED='$DATA_PROBE_BREAKER_LOGGED'
-PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
-PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
-PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
-PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
-LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
 PROCESS_HEALTHY_SINCE='$PROCESS_HEALTHY_SINCE'
 PROCESS_DOWN_SINCE='$PROCESS_DOWN_SINCE'
 STATEEOF
@@ -2872,6 +2982,75 @@ prune_epoch_list() {
         (( epoch >= cutoff )) && kept="${kept:+$kept }$epoch"
     done
     printf '%s\n' "$kept"
+}
+
+init_process_recovery_paths() {
+    local shared_id runtime_dir
+    shared_id="${UNIT%.service}"
+    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
+    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-/run}"
+    [[ -d "$runtime_dir" ]] || mkdir -p "$runtime_dir" || return 1
+    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}-process-recovery.lock"
+    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}-process-recovery.state"
+}
+
+reset_process_recovery_state() {
+    PROCESS_RECOVERY_EPOCHS=""
+    PROCESS_BREAKER_STATE="closed"
+    PROCESS_BREAKER_UNTIL=0
+    PROCESS_BREAKER_LOGGED=0
+    LAST_PROCESS_RECOVERY=0
+}
+
+load_process_recovery_state() {
+    local process_state_boot_id=""
+    reset_process_recovery_state
+    [[ -n "$PROCESS_RECOVERY_STATE_FILE" && -r "$PROCESS_RECOVERY_STATE_FILE" ]] || return 1
+
+    process_state_boot_id="$(awk -F"'" 'NR == 1 && $1 == "PROCESS_STATE_BOOT_ID=" { print $2; exit }' \
+        "$PROCESS_RECOVERY_STATE_FILE" 2>/dev/null || true)"
+    [[ -n "$process_state_boot_id" && "$process_state_boot_id" == "$BOOT_ID" ]] || return 1
+
+    # /run 下的文件由 root Watchdog 以 0600 原子写入，内容只包含下列受校验字段。
+    # shellcheck disable=SC1090
+    if ! source "$PROCESS_RECOVERY_STATE_FILE"; then
+        reset_process_recovery_state
+        return 1
+    fi
+    if [[ "${PROCESS_STATE_BOOT_ID:-}" != "$BOOT_ID" ||
+          ! "$PROCESS_BREAKER_UNTIL" =~ ^[0-9]+$ ||
+          ! "$PROCESS_BREAKER_LOGGED" =~ ^[01]$ ||
+          ! "$LAST_PROCESS_RECOVERY" =~ ^[0-9]+$ ]] ||
+       [[ "$PROCESS_RECOVERY_EPOCHS" =~ [^0-9\ ] ]] ||
+       [[ "$PROCESS_BREAKER_STATE" != "closed" && "$PROCESS_BREAKER_STATE" != "open" ]]; then
+        reset_process_recovery_state
+        return 1
+    fi
+    return 0
+}
+
+save_process_recovery_state() {
+    local runtime_dir tmp
+    runtime_dir="$(dirname "$PROCESS_RECOVERY_STATE_FILE")"
+    mkdir -p "$runtime_dir" || return 1
+    umask 077
+    tmp="$(mktemp "${PROCESS_RECOVERY_STATE_FILE}.tmp.XXXXXX")" || return 1
+    if ! cat > "$tmp" <<STATEEOF
+PROCESS_STATE_BOOT_ID='$BOOT_ID'
+PROCESS_RECOVERY_EPOCHS='$PROCESS_RECOVERY_EPOCHS'
+PROCESS_BREAKER_STATE='$PROCESS_BREAKER_STATE'
+PROCESS_BREAKER_UNTIL='$PROCESS_BREAKER_UNTIL'
+PROCESS_BREAKER_LOGGED='$PROCESS_BREAKER_LOGGED'
+LAST_PROCESS_RECOVERY='$LAST_PROCESS_RECOVERY'
+STATEEOF
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$PROCESS_RECOVERY_STATE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 close_data_probe_breaker() {
@@ -2928,11 +3107,41 @@ allow_data_probe_restart() {
 }
 
 close_process_breaker() {
-    if [[ "$PROCESS_BREAKER_STATE" != "closed" || -n "$PROCESS_RECOVERY_EPOCHS" ]]; then
-        log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    local now="${1:-$(now_epoch)}"
+    init_process_recovery_paths || return 1
+    # fd 9 专用于短生命周期的共享 PROCESS lock；启动时的 route lock 由
+    # Bash 动态分配到 >=10，不会与它冲突。
+    exec 9>"$PROCESS_RECOVERY_LOCK_FILE" || return 1
+    if ! flock -n 9; then
+        exec 9>&-
+        return 1
     fi
-    PROCESS_RECOVERY_EPOCHS=""; PROCESS_BREAKER_STATE="closed"
-    PROCESS_BREAKER_UNTIL=0; PROCESS_BREAKER_LOGGED=0; LAST_PROCESS_RECOVERY=0
+
+    # 只允许已持续健康的调用方关闭共享 breaker；同时要求最后一次全局
+    # recovery 已经过完整 interval，避免漏看短暂 DOWN 的线路过早清空预算。
+    if ! service_is_active || (( $(get_main_pid) <= 0 )); then
+        exec 9>&-
+        return 1
+    fi
+    load_process_recovery_state || true
+    if [[ "$PROCESS_BREAKER_STATE" == "closed" && -z "$PROCESS_RECOVERY_EPOCHS" ]]; then
+        exec 9>&-
+        return 0
+    fi
+    if (( LAST_PROCESS_RECOVERY > 0 && now - LAST_PROCESS_RECOVERY < PROCESS_RECOVERY_INTERVAL_SEC )); then
+        exec 9>&-
+        return 1
+    fi
+
+    log_event "$STATE" "PROCESS_BREAKER_CLOSED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+    reset_process_recovery_state
+    if ! save_process_recovery_state; then
+        log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" "$LAST_PID" "$LAST_SPORT"
+        exec 9>&-
+        return 2
+    fi
+    exec 9>&-
+    return 0
 }
 
 allow_process_recovery() {
@@ -2981,33 +3190,49 @@ allow_process_recovery() {
 }
 
 recover_process_rate_limited() {
-    local now="$1" shared_id shared_lock
-    allow_process_recovery "$now" || return 1
-    shared_id="${UNIT%.service}"
-    shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
-    shared_lock="/run/${shared_id}-process-recovery.lock"
-    exec {PROCESS_LOCK_FD}>"$shared_lock"
-    if ! flock -n "$PROCESS_LOCK_FD"; then
-        exec {PROCESS_LOCK_FD}>&-
+    local now="$1"
+    init_process_recovery_paths || return 2
+    exec 9>"$PROCESS_RECOVERY_LOCK_FILE" || return 2
+    if ! flock -n 9; then
+        exec 9>&-
         return 1
     fi
 
-    # 多条线路的 Watchdog 共享同一个 GOST。拿到全局锁后必须复查，避免它们
-    # 在同一轮同时 restart 公共进程。
+    # 锁内按顺序完成复查、共享状态读取、预算判断、attempt 落盘和 restart。
+    # 因此后拿锁的其他线路会看到同一份 interval/window/max 预算，而不只是
+    # 被阻止并发 restart。
     if service_is_active && (( $(get_main_pid) > 0 )); then
-        exec {PROCESS_LOCK_FD}>&-
+        exec 9>&-
         return 0
     fi
+    load_process_recovery_state || true
+    if ! allow_process_recovery "$now"; then
+        if ! save_process_recovery_state; then
+            log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" 0
+            exec 9>&-
+            return 2
+        fi
+        exec 9>&-
+        return 1
+    fi
+    # attempt 必须先持久化再执行 restart；即使 restart 失败或 Watchdog 被终止，
+    # 下一条线路也不能拿到一套新的预算。
+    if ! save_process_recovery_state; then
+        log_event "FAULT" "PROCESS_RECOVERY_STATE_WRITE_FAILED" "PROCESS" 0
+        exec 9>&-
+        return 2
+    fi
+
     log_event "DOWN" "PROCESS_RECOVERY_ATTEMPT" "PROCESS" 0 "" "" "" \
         "attempts=$(wc -w <<< "$PROCESS_RECOVERY_EPOCHS" | tr -d ' ')"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
     if ! systemctl restart "$UNIT"; then
         log_event "FAULT" "PROCESS_RECOVERY_FAILED" "PROCESS" 0
-        exec {PROCESS_LOCK_FD}>&-
+        exec 9>&-
         return 2
     fi
     log_event "DOWN" "PROCESS_RECOVERY_STARTED" "PROCESS" 0
-    exec {PROCESS_LOCK_FD}>&-
+    exec 9>&-
     return 0
 }
 
@@ -3131,15 +3356,21 @@ adopt_current() {
     save_runtime_state
 }
 
+init_process_recovery_paths || { echo "cannot initialize shared PROCESS recovery state" >&2; exit 1; }
+load_process_recovery_state || true
 if (( ADOPT_MODE == 1 )); then
     adopt_current
     exit $?
 fi
 
 load_runtime_state || true
+# 兼容升级前 route-local runtime.state 中残留的 PROCESS_* 字段；共享快照优先。
+load_process_recovery_state || true
 
 while true; do
     load_config "$CONFIG" || { sleep 5; continue; }
+    init_process_recovery_paths || { sleep 5; continue; }
+    load_process_recovery_state || true
     now="$(now_epoch)"
     if (( now - LAST_PRUNE >= 3600 )); then prune_events; LAST_PRUNE="$now"; fi
 
@@ -3155,9 +3386,13 @@ while true; do
         set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
         if (( now - PROCESS_DOWN_SINCE >= PROCESS_RECOVERY_GRACE_SEC )); then
             recover_process_rate_limited "$now" || true
+            # 非持锁线路也立即读取 winner 已写入的 attempt/breaker 快照。
+            load_process_recovery_state || true
         fi
         if [[ "$PROCESS_BREAKER_STATE" == "open" ]]; then
             set_state "FAULT" "PROCESS_BREAKER" "$pid" "" "" "" 0
+        else
+            set_state "DOWN" "PROCESS" "$pid" "" "" "" 0
         fi
         save_runtime_state; sleep "${WATCH_INTERVAL_SEC:-5}"; continue
     fi
@@ -3167,7 +3402,7 @@ while true; do
     if (( PROCESS_HEALTHY_SINCE == 0 )); then
         PROCESS_HEALTHY_SINCE="$now"
     elif (( now - PROCESS_HEALTHY_SINCE >= PROCESS_RECOVERY_INTERVAL_SEC )); then
-        close_process_breaker
+        close_process_breaker "$now" || true
     fi
 
     # 无可用 runtime（首次部署/重启 watchdog 且状态被清理/跨 reboot）：明确记录 COLD_START，不冒充 GOST 重启。

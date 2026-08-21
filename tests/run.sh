@@ -13,8 +13,10 @@ file_mode() {
     stat -f '%Lp' "$1"
 }
 
-bash -n install.sh standalone-install.sh scripts/generate-standalone.sh cn/compile-config.sh \
-    ecmp-test.sh cn/mtcp-lib.sh cn/mtcp-prewarm.sh cn/mtcp-watchdog.sh
+for shell_file in install.sh standalone-install.sh scripts/generate-standalone.sh cn/compile-config.sh \
+    ecmp-test.sh cn/mtcp-lib.sh cn/mtcp-prewarm.sh cn/mtcp-watchdog.sh; do
+    bash -n "$shell_file"
+done
 pass "all shell files parse"
 
 (
@@ -85,8 +87,23 @@ cn/compile-config.sh "$compile_test_dir/runtime.yaml" cn/cn.yaml
 if cn/compile-config.sh "$compile_test_dir/duplicate.yaml" cn/cn.yaml cn/cn.yaml >/dev/null 2>&1; then
     fail "route compiler accepted duplicate services, chains, and Remote endpoints"
 fi
+sed -e 's/default/jp/g' -e 's/:12000/:12100/g' -e 's/:12001/:12101/g' \
+    -e 's/remote\.example\.invalid:6600/198.51.100.20:6601/g' cn/cn.yaml > "$compile_test_dir/jp.yaml"
+cn/compile-config.sh "$compile_test_dir/two-routes.yaml" cn/cn.yaml "$compile_test_dir/jp.yaml"
+awk '
+    !changed && $0 == "    chain: chain-mtcp-default" {
+        print "    chain: chain-mtcp-jp"
+        changed=1
+        next
+    }
+    { print }
+' cn/cn.yaml > "$compile_test_dir/cross-route.yaml"
+if cn/compile-config.sh "$compile_test_dir/cross-route-runtime.yaml" \
+    "$compile_test_dir/cross-route.yaml" "$compile_test_dir/jp.yaml" >/dev/null 2>&1; then
+    fail "route compiler accepted a service wired to another route's existing chain"
+fi
 rm -rf "$compile_test_dir"
-pass "route compiler rejects aggregate identity and endpoint conflicts"
+pass "route compiler enforces aggregate uniqueness and fragment ownership"
 
 help_output="$(bash standalone-install.sh --help)"
 [[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* ]] || \
@@ -112,6 +129,10 @@ case "\$command_name" in
   restart)
     [[ "\${MOCK_FAIL_RESTART:-0}" == 1 ]] && exit 1
     for unit in "\$@"; do touch "\$state_dir/\$unit"; done
+    ;;
+  stop)
+    [[ "\${MOCK_FAIL_STOP:-0}" == 1 ]] && exit 1
+    for unit in "\$@"; do rm -f "\$state_dir/\$unit"; done
     ;;
   show) echo 0 ;;
   *) exit 0 ;;
@@ -146,8 +167,10 @@ MOCK
     SYSTEMD_DIR="$integration_dir/systemd"
     SYSTEMCTL_BIN="$integration_dir/bin/systemctl-mock"
     download_gost() {
+        local mock_version="${MOCK_GOST_VERSION:-v1}" mock_rc=0
         mkdir -p "$2"
-        printf '#!/usr/bin/env bash\nexit 0\n' > "$2/gost"
+        [[ "$mock_version" == invalid ]] && mock_rc=1
+        printf '#!/usr/bin/env bash\n# mock-gost-%s\nexit %s\n' "$mock_version" "$mock_rc" > "$2/gost"
         chmod +x "$2/gost"
     }
     prompt_read() {
@@ -223,6 +246,63 @@ LEGACY
     grep -Fq -- '- name: tcp-entry-us' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses us service"
     grep -Fqx "ExecStart=$INSTALL_BASE/cn/mtcp-watchdog.sh $jp/mtcp.conf" \
         "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" || fail "watchdog unit does not use isolated state config"
+
+    # 正式 shared artifacts 必须在全部 validation 前保持不变，并在 commit 后的
+    # service failure 中与 route/runtime/units 一起回滚。
+    shared_marker="# preserved-shared-artifact-v1"
+    shared_scripts=(mtcp-lib.sh mtcp-prewarm.sh mtcp-watchdog.sh compile-config.sh)
+    for shared_script in "${shared_scripts[@]}"; do
+        printf '%s\n' "$shared_marker" >> "$INSTALL_BASE/cn/$shared_script"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || fail "unexpected initial mock GOST version"
+
+    set +e
+    ( export MOCK_GOST_VERSION=invalid
+      PROMPTS=(validationfail 203.0.113.30 6700 45120 45121 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    validation_failure_rc=$?
+    set -e
+    (( validation_failure_rc != 0 )) || fail "invalid staged GOST unexpectedly passed validation"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script changed before candidate validation completed"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "formal GOST changed before candidate validation completed"
+    ! grep -Fq 'chain-mtcp-validationfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "failed validation leaked into aggregate runtime"
+
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_STOP=1
+      PROMPTS=(stopfail 203.0.113.32 6702 45124 45125 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    shared_stop_failure_rc=$?
+    set -e
+    (( shared_stop_failure_rc != 0 )) || fail "route-control stop failure simulation unexpectedly succeeded"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script changed even though route controls did not stop"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "formal GOST changed even though route controls did not stop"
+    ! grep -Fq 'chain-mtcp-stopfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "failed route-control stop leaked into aggregate runtime"
+
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_RESTART=1
+      PROMPTS=(restartfail 203.0.113.31 6701 45122 45123 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    shared_restart_failure_rc=$?
+    set -e
+    (( shared_restart_failure_rc != 0 )) || fail "shared restart failure simulation unexpectedly succeeded"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script was not restored with the shared transaction"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "GOST binary was not restored with the shared transaction"
+    ! grep -Fq 'chain-mtcp-restartfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "failed shared commit was not removed from aggregate runtime"
 
     config_listing="$(list_installed_configurations)"
     [[ "$config_listing" == *"线路 jp"* && "$config_listing" == *"线路 us"* && \
@@ -443,6 +523,59 @@ awk '/^prune_epoch_list\(\)/ { emit=1 } /^set_state\(\)/ { exit } emit { print }
         fail "process breaker did not arm after three attempts"
 )
 pass "data-plane and process breakers enforce window, open, and half-open behavior"
+
+(
+    # 模拟三个独立 Watchdog：每次清空进程内变量，但共用同一 /run 替代目录。
+    # 第二个 Watchdog 必须读到第一个已经落盘的 interval/window budget。
+    # shellcheck disable=SC1090
+    source "$tmp_dir/breakers.sh"
+    log_event() { :; }
+    service_is_active() { return 1; }
+    get_main_pid() { echo 0; }
+    if ! command -v flock >/dev/null 2>&1; then
+        flock() { return 0; }
+    fi
+    systemctl() {
+        if [[ "${1:-}" == restart ]]; then
+            printf '%s\n' "${2:-missing}" >> "$MTCP_PROCESS_RUNTIME_DIR/restarts.log"
+        fi
+        return 0
+    }
+
+    MTCP_PROCESS_RUNTIME_DIR="$tmp_dir/shared-process"
+    mkdir -p "$MTCP_PROCESS_RUNTIME_DIR"
+    BOOT_ID="test-boot-id"
+    UNIT="gost-mtcp.service"
+    STATE=DOWN; LAST_PID=0; LAST_SPORT=""
+    PROCESS_RECOVERY_INTERVAL_SEC=60; PROCESS_RECOVERY_WINDOW_SEC=600
+    PROCESS_RECOVERY_MAX=3; PROCESS_BREAKER_OPEN_SEC=600
+    init_process_recovery_paths
+
+    reset_process_recovery_state
+    recover_process_rate_limited 100
+    reset_process_recovery_state
+    if recover_process_rate_limited 120; then
+        fail "a second watchdog bypassed the shared process recovery interval"
+    fi
+    reset_process_recovery_state
+    recover_process_rate_limited 160
+    reset_process_recovery_state
+    recover_process_rate_limited 220
+    reset_process_recovery_state
+    if recover_process_rate_limited 280; then
+        fail "a later watchdog bypassed the shared open process breaker"
+    fi
+
+    [[ "$(wc -l < "$MTCP_PROCESS_RUNTIME_DIR/restarts.log" | tr -d ' ')" == 3 ]] || \
+        fail "shared process budget did not cap restart attempts globally"
+    grep -Fqx "PROCESS_RECOVERY_EPOCHS='100 160 220'" "$PROCESS_RECOVERY_STATE_FILE" || \
+        fail "shared process recovery epochs were not persisted"
+    grep -Fqx "PROCESS_BREAKER_STATE='open'" "$PROCESS_RECOVERY_STATE_FILE" || \
+        fail "shared process breaker did not persist its open state"
+    [[ "$(file_mode "$PROCESS_RECOVERY_STATE_FILE")" == 600 ]] || \
+        fail "shared process recovery state permissions are not 0600"
+)
+pass "all route watchdogs share one locked PROCESS recovery budget"
 
 git diff --check
 pass "patch has no whitespace errors"

@@ -260,7 +260,7 @@ DATA_PROBE_BREAKER_OPEN_SEC=600
 
 把 `DATA_PROBE_ENABLED` 改成 `no` 可以退回旧版行为, 只看 outer 的 TCP 状态。如果探测 endpoint 配错了或者一直失败, 10 分钟内线路 outer 重置满 3 次就会进 `FAULT/DATA_PROBE_BREAKER`, 停 10 分钟不再重置; 之后只放一次 half-open 试探, 数据面探测成功了才会关闭熔断。
 
-GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。进程连续健康 60 秒后熔断器自动关闭。
+GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。PROCESS breaker 是共享 GOST 的全局状态：所有线路通过 `/run/gost-mtcp-process-recovery.lock` 串行读改写同一份 `/run/gost-mtcp-process-recovery.state`，共同使用一套恢复预算，而不是每条线路各算 3 次。进程连续健康 60 秒后熔断器自动关闭。
 
 ### 故障恢复路径(均已实测)
 
@@ -313,9 +313,11 @@ CN 全机只运行一个 `gost-mtcp.service`。每条线路保留独立的 fragm
     └── us/  -> cn.yaml, mtcp.conf, mtcp.auth, state/
 ```
 
-聚合配置中的对象名按线路隔离，例如 `tcp-entry-jp`、`mtcp-anchor-jp`、`chain-mtcp-jp`。每条线路必须使用唯一的 Remote `IP:port`；否则同一 PID 下无法可靠判断某条 outer 属于哪条线路，安装器和编译器都会拒绝。
+聚合配置中的对象名按线路隔离，例如 `tcp-entry-jp`、`mtcp-anchor-jp`、`chain-mtcp-jp`。每条线路必须使用唯一的 Remote `IP:port`；否则同一 PID 下无法可靠判断某条 outer 属于哪条线路，安装器和编译器都会拒绝。编译器还会 fail closed 校验 fragment ownership：`jp` fragment 必须定义 `chain-mtcp-jp` 和 `mtcp-anchor-jp`，其中每个 service 只能引用 `chain-mtcp-jp`，不能借用聚合文件中另一条线路的 chain。
 
-新增/重装线路会原子重建并校验 `runtime.yaml`，停止各线路 Anchor/Watchdog，然后只重启一次共享 GOST。这个管理动作会中断所有线路的现有连接；菜单检测到活跃业务时会显示连接数并要求再次明确确认，直接命令或自动化则默认拒绝，需设置 `CN_FORCE_RESTART=1`。运行期间的慢路重抽、stale outer 和单线路恢复只重置对应 Remote endpoint，不重启共享进程。
+新增/重装线路会先在隔离 staging 中准备并校验候选 GOST binary、`mtcp-lib.sh`、`mtcp-prewarm.sh`、`mtcp-watchdog.sh`、`compile-config.sh`、`runtime.yaml`、线路文件和 units；全部通过后才停止各线路 Anchor/Watchdog，并把这些 shared artifacts 纳入同一个备份、提交和回滚事务，然后只重启一次共享 GOST。这个管理动作会中断所有线路的现有连接；菜单检测到活跃业务时会显示连接数并要求再次明确确认，直接命令或自动化则默认拒绝，需设置 `CN_FORCE_RESTART=1`。运行期间的慢路重抽、stale outer 和单线路恢复只重置对应 Remote endpoint，不重启共享进程。
+
+当前管理策略是“已安装线路即受管且 Watchdog 常开”：CN 配置事务结束时会重新 enable/restart 所有已安装线路的 Watchdog。手工 `disable --now` 不是持久 maintenance 状态，后续配置变更会重新启用；如需线路维护模式，应先实现显式的 route enable/disable 状态再改变这一策略。
 
 从旧版多 GOST 部署升级时，逐条停止旧线路并重新执行 `standalone-install.sh cn`。已迁移线路进入共享进程；尚未迁移的旧 fragment 暂不纳入 `runtime.yaml`，直到该线路完成重装。
 
