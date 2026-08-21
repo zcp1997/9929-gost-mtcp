@@ -132,18 +132,25 @@ ui_confirm() {
 }
 
 ui_run_action() {
-    local label="$1" return_target="$2" rc
+    local label="$1" return_target="$2" rc had_errexit=0
     shift 2
-    if (
+
+    # 不能把 action 子 shell 直接放进 `if (...)`：Bash 会在条件上下文中关闭
+    # errexit，令安装函数里依赖 `set -e` 的失败被忽略并继续提交。
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    (
+        set -e
         # 子操作隔离执行，但重新挂载 cleanup；只清理本次操作创建的临时文件，
         # 不触碰父菜单为 piped execution 保存的 EMBEDDED_SOURCE。
         CLEANUP_PATHS=()
         trap cleanup EXIT
         "$@"
-    ); then
-        rc=0
-    else
-        rc=$?
+    )
+    rc=$?
+    (( had_errexit == 0 )) || set -e
+
+    if (( rc != 0 )); then
         ui_error "$label 失败（exit $rc）"
     fi
     ui_pause "$return_target"
@@ -875,7 +882,10 @@ start_cn_route_watchdogs() {
         watchdog="$(read_config_value "$config" WATCHDOG_UNIT 2>/dev/null || true)"
         [[ "$watchdog" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
         [[ -e "$SYSTEMD_DIR/$watchdog" || -L "$SYSTEMD_DIR/$watchdog" ]] || continue
-        "$SYSTEMCTL_BIN" enable "$watchdog" >/dev/null 2>&1 || true
+        if ! "$SYSTEMCTL_BIN" enable "$watchdog" >/dev/null 2>&1; then
+            echo "无法启用 Watchdog unit: $watchdog" >&2
+            return 1
+        fi
         "$SYSTEMCTL_BIN" restart "$watchdog" || return 1
     done
 }
@@ -1184,7 +1194,14 @@ install_cn() {
     extract_embedded CN_WATCHDOG_SERVICE | awk -v canonical="gost-ecmp-pathlock.service" -v main="$main_unit" \
         -v root="/root/gost-ecmp-pathlock/cn" -v cn="$cn_dir" -v wd="$instance_dir" \
         -v config="$instance_dir/mtcp.conf" '
-        function repl(s,a,b) { while ((p=index(s,a))>0) s=substr(s,1,p-1) b substr(s,p+length(a)); return s }
+        function repl(text, old, replacement, pos, result) {
+            result=""
+            while ((pos=index(text,old)) > 0) {
+                result=result substr(text,1,pos-1) replacement
+                text=substr(text,pos+length(old))
+            }
+            return result text
+        }
         { line=repl($0,canonical,main); line=repl(line,root "/mtcp.conf",config); line=repl(line,root,cn)
           if (line ~ /^WorkingDirectory=/) line="WorkingDirectory=" wd; print line }
     ' > "$watchdog_unit_tmp"
@@ -1255,11 +1272,13 @@ install_cn() {
         die "无法提交共享 CN artifacts 与配置；已尝试恢复原状态"
     fi
 
-    "$SYSTEMCTL_BIN" daemon-reload
-    "$SYSTEMCTL_BIN" enable "$main_unit" >/dev/null 2>&1 || true
-    if "$SYSTEMCTL_BIN" restart "$main_unit" && "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" &&
-       start_cn_route_watchdogs "$cn_dir"; then
-        restart_ok=1
+    # daemon-reload 也属于提交事务；若它失败，不能越过回滚直接退出或继续启动。
+    if "$SYSTEMCTL_BIN" daemon-reload &&
+       "$SYSTEMCTL_BIN" enable "$main_unit"; then
+        if "$SYSTEMCTL_BIN" restart "$main_unit" && "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" &&
+           start_cn_route_watchdogs "$cn_dir"; then
+            restart_ok=1
+        fi
     fi
 
     if (( restart_ok != 1 )); then
@@ -1547,8 +1566,9 @@ select_cn_route() {
     while :; do
         ui_menu_choice choice "请选择 › " || return 1
         case "$choice" in b|B|back|q|Q) return 1 ;; esac
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DISCOVERED_CN_YAMLS[@]} )); then
-            index=$((choice - 1))
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+           (( 10#$choice >= 1 && 10#$choice <= ${#DISCOVERED_CN_YAMLS[@]} )); then
+            index=$((10#$choice - 1))
             printf -v "$output_yaml_var" '%s' "${DISCOVERED_CN_YAMLS[$index]}"
             printf -v "$output_config_var" '%s' "${DISCOVERED_CN_CONFIGS[$index]}"
             return 0
@@ -1733,7 +1753,11 @@ apply_cn_relay_yaml() {
     cp -p "$CN_RELAY_CONFIG" "$config_backup"
     [[ -f "$CN_RUNTIME_YAML" ]] && cp -p "$CN_RUNTIME_YAML" "$runtime_backup"
     chmod 0644 "$candidate" "$config_candidate" "$runtime_candidate"
-    stop_cn_route_controls "$CN_ROOT"
+    if ! stop_cn_route_controls "$CN_ROOT" 1; then
+        rm -f "$backup" "$config_backup" "$runtime_backup"
+        start_cn_route_watchdogs "$CN_ROOT" >/dev/null 2>&1 || true
+        die "无法停止全部线路控制单元；原配置未修改"
+    fi
 
     if ! mv -f "$candidate" "$CN_RELAY_YAML" ||
        ! mv -f "$config_candidate" "$CN_RELAY_CONFIG" ||
@@ -1807,11 +1831,14 @@ add_cn_relay() {
             ui_error "服务名只能包含字母、数字、下划线和连字符"
             continue
         fi
-        if [[ "$service_name" == "$CN_RELAY_ANCHOR_SERVICE" ]]; then
-            (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
-            ui_error "$CN_RELAY_ANCHOR_SERVICE 是保留服务名"
-            continue
-        fi
+        case "$service_name" in
+            tcp-entry|tcp-entry-default|"tcp-entry-$CN_ROUTE_ID"|mtcp-anchor|mtcp-anchor-default|"$CN_RELAY_ANCHOR_SERVICE")
+                (( PATHLOCK_INTERACTIVE_MENU == 1 )) || \
+                    die "$service_name 是安装器保留服务名"
+                ui_error "$service_name 是安装器保留服务名"
+                continue
+                ;;
+        esac
         break
     done
 
@@ -1886,8 +1913,9 @@ remove_cn_relay() {
         done
         while :; do
             ui_menu_choice choice "请选择 › " || die "未选择 Relay"
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
-                requested="${candidates[$((choice - 1))]%%$'\t'*}"
+            if [[ "$choice" =~ ^[0-9]+$ ]] &&
+               (( 10#$choice >= 1 && 10#$choice <= ${#candidates[@]} )); then
+                requested="${candidates[$((10#$choice - 1))]%%$'\t'*}"
                 break
             fi
             (( PATHLOCK_INTERACTIVE_MENU == 1 )) || die "选择无效"

@@ -126,6 +126,9 @@ case "\$command_name" in
     [[ "\${1:-}" == --quiet ]] && shift
     [[ -f "\$state_dir/\${1:-missing}" ]]
     ;;
+  enable)
+    [[ "\${MOCK_FAIL_ENABLE:-0}" != 1 ]]
+    ;;
   restart)
     [[ "\${MOCK_FAIL_RESTART:-0}" == 1 ]] && exit 1
     for unit in "\$@"; do touch "\$state_dir/\$unit"; done
@@ -135,6 +138,9 @@ case "\$command_name" in
     for unit in "\$@"; do rm -f "\$state_dir/\$unit"; done
     ;;
   show) echo 0 ;;
+  daemon-reload)
+    [[ "\${MOCK_FAIL_DAEMON_RELOAD:-0}" != 1 ]]
+    ;;
   *) exit 0 ;;
 esac
 MOCK
@@ -247,6 +253,23 @@ MOCK
     [[ "$PROMPT_INDEX" == 1 ]] || fail "failed menu action did not pause before returning"
     grep -q '测试操作 失败' "$ui_action_output" || fail "failed menu action did not render an error"
     [[ ! -e "$ui_failure_tmp" ]] || fail "isolated menu action leaked temporary files"
+
+    # action 不能作为 if 条件执行，否则 Bash 会悄悄禁用整个调用链的 errexit。
+    ui_errexit_before="$integration_dir/ui-errexit.before"
+    ui_errexit_after="$integration_dir/ui-errexit.after"
+    ui_test_errexit() {
+        : > "$ui_errexit_before"
+        false
+        : > "$ui_errexit_after"
+    }
+    PROMPTS=(""); PROMPT_INDEX=0
+    ui_errexit_output="$integration_dir/ui-errexit.out"
+    ui_run_action "errexit 测试" "主菜单" ui_test_errexit >"$ui_errexit_output" 2>&1 || \
+        fail "menu errexit test escaped to the manager"
+    [[ -e "$ui_errexit_before" && ! -e "$ui_errexit_after" ]] || \
+        fail "menu action ignored an unhandled command failure"
+    grep -q 'errexit 测试 失败' "$ui_errexit_output" || \
+        fail "menu action did not report an errexit failure"
 
     relay_card_output="$integration_dir/relay-card.out"
     ui_relay_change_card "新增" jp :12002 127.0.0.1:2347 chain-mtcp-jp 7 \
@@ -391,6 +414,38 @@ STALE
         fail "failed route-control stop leaked into aggregate runtime"
 
     set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_DAEMON_RELOAD=1
+      PROMPTS=(reloadfail 203.0.113.34 6704 45128 45129 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    shared_reload_failure_rc=$?
+    set -e
+    (( shared_reload_failure_rc != 0 )) || fail "daemon-reload failure simulation unexpectedly succeeded"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script was not restored after daemon-reload failure"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "GOST binary was not restored after daemon-reload failure"
+    ! grep -Fq 'chain-mtcp-reloadfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "daemon-reload failure leaked into aggregate runtime"
+
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_ENABLE=1
+      PROMPTS=(enablefail 203.0.113.35 6705 45130 45131 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    shared_enable_failure_rc=$?
+    set -e
+    (( shared_enable_failure_rc != 0 )) || fail "systemd enable failure simulation unexpectedly succeeded"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script was not restored after systemd enable failure"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "GOST binary was not restored after systemd enable failure"
+    ! grep -Fq 'chain-mtcp-enablefail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "systemd enable failure leaked into aggregate runtime"
+
+    set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_RESTART=1
       PROMPTS=(restartfail 203.0.113.31 6701 45122 45123 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
@@ -410,7 +465,7 @@ STALE
     [[ "$config_listing" == *"线路 jp"* && "$config_listing" == *"线路 us"* && \
        "$config_listing" == *"端口路径"* && "$config_listing" == *"127.0.0.1:2345"* ]] || \
         fail "management menu did not list routes and port paths"
-    PROMPTS=(2); PROMPT_INDEX=0
+    PROMPTS=(02); PROMPT_INDEX=0
     selected_yaml=""; selected_config=""
     route_selector_output="$integration_dir/route-selector.out"
     select_cn_route selected_yaml selected_config "测试线路选择" >"$route_selector_output" || fail "route selection failed"
@@ -499,6 +554,44 @@ MOCK
     CN_PRIMARY_PORT=45100; CN_ANCHOR_PORT=45101
     CN_ROOT="$INSTALL_BASE/cn"; CN_RUNTIME_YAML="$CN_ROOT/runtime.yaml"
     CN_COMPILE_SCRIPT="$CN_ROOT/compile-config.sh"
+
+    set +e
+    ( PROMPTS=(45108 127.0.0.1:2351 tcp-entry); PROMPT_INDEX=0
+      add_cn_relay >/dev/null 2>&1 )
+    reserved_relay_name_rc=$?
+    set -e
+    (( reserved_relay_name_rc != 0 )) || fail "Relay manager accepted a migration-reserved service name"
+    ! grep -q '45108' "$CN_RELAY_YAML" || fail "reserved Relay service name modified route YAML"
+
+    strict_stop_candidate="$(mktemp "$jp/.relay-strict-stop-test.XXXXXX")"
+    awk '
+      /^- name:[[:space:]]*mtcp-anchor-jp[[:space:]]*$/ && !inserted {
+        print "# standalone-relay: relay-45107"
+        print "- name: relay-45107"
+        print "  addr: :45107"
+        print "  handler:"
+        print "    type: tcp"
+        print "    chain: chain-mtcp-jp"
+        print "  listener:"
+        print "    type: tcp"
+        print "  forwarder:"
+        print "    nodes:"
+        print "    - name: backend-45107"
+        print "      addr: 127.0.0.1:2350"
+        print ""
+        inserted=1
+      }
+      { print }
+    ' "$CN_RELAY_YAML" > "$strict_stop_candidate"
+    set +e
+    ( export MOCK_FAIL_STOP=1
+      apply_cn_relay_yaml "$strict_stop_candidate" "strict stop integration test" >/dev/null 2>&1 )
+    relay_stop_failure_rc=$?
+    set -e
+    (( relay_stop_failure_rc != 0 )) || fail "Relay update ignored active control units that failed to stop"
+    ! grep -q '45107' "$CN_RELAY_YAML" || fail "failed Relay stop modified route YAML"
+    ! grep -q '45107' "$CN_RUNTIME_YAML" || fail "failed Relay stop modified aggregate YAML"
+
     relay_candidate="$(mktemp "$jp/.relay-test.XXXXXX")"
     awk '
       /^- name:[[:space:]]*mtcp-anchor-jp[[:space:]]*$/ && !inserted {
@@ -752,6 +845,26 @@ pass "data-plane and process breakers enforce window, open, and half-open behavi
         fail "shared process recovery state permissions are not 0600"
 )
 pass "all route watchdogs share one locked PROCESS recovery budget"
+
+! grep -Fq 'while ((p=index(s,a))>0) s=' standalone-install.sh || \
+    fail "watchdog unit literal replacement can rescan its own replacement forever"
+awk '
+    /^[[:space:]]*function repl\(text, old, replacement/ { emit=1 }
+    emit { print }
+    emit && /^        }$/ { exit }
+' standalone-install.sh > "$tmp_dir/watchdog-unit-repl.awk"
+cat >> "$tmp_dir/watchdog-unit-repl.awk" <<'AWK'
+BEGIN {
+    old="/root/gost-ecmp-pathlock/cn"
+    replacement="/tmp/prefix" old
+    input="Environment=\"MTCP_LIB=" old "/mtcp-lib.sh\""
+    expected="Environment=\"MTCP_LIB=" replacement "/mtcp-lib.sh\""
+    if (repl(input, old, replacement) != expected) exit 1
+}
+AWK
+awk -f "$tmp_dir/watchdog-unit-repl.awk" /dev/null || \
+    fail "watchdog unit literal replacement mishandled an INSTALL_BASE containing the canonical path"
+pass "watchdog unit rendering consumes only the original template text"
 
 git diff --check
 pass "patch has no whitespace errors"
